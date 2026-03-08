@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brainbank-extract"
+version = "0.1.0"
+description = "Extract analysis-ready neuroimaging features from FreeSurfer and QSIRecon derivatives"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = [
+    "nibabel>=4.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+bb-extract = "brainbank_extract.cli:extract"
+bb-aggregate = "brainbank_extract.cli:aggregate"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brainbank_extract"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
