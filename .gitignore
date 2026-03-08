@@ -13,3 +13,5 @@ htmlcov/
 *.npy
 *.log
 .DS_Store
+
+data

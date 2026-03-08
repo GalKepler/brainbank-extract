@@ -2,23 +2,40 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+import nibabel as nib
 import numpy as np
 import pandas as pd
+import scipy.io
+
+from brainbank_extract import __version__
+from brainbank_extract.atlases import (
+    build_label_filter,
+    get_atlas,
+    get_containing_combined_atlases,
+)
+from brainbank_extract.io import write_status_json, write_tsv
 
 logger = logging.getLogger(__name__)
 
+# Column names for diffusion scalar output TSVs
+_SCALAR_COLS = ["region_index", "region_label", "hemisphere", "mean", "std", "median", "n_voxels"]
+
 
 class QSIReconExtractor:
-    """Extract diffusion features from a QSIRecon session directory.
+    """Extract diffusion features from QSIRecon derivative directories.
 
     Parameters
     ----------
     qsirecon_dir:
-        Path to the QSIRecon subject/session directory
-        (contains ``dwi/`` subdirectory with parcellated TSVs and connectivity files).
+        Path to the **root** QSIRecon derivatives directory (the one containing
+        ``sub-*/`` session directories and a ``derivatives/`` subdirectory with
+        pipeline-specific outputs).
     output_dir:
         Path where extracted files will be written (``dwi/`` subdirectory).
     subject:
@@ -26,7 +43,7 @@ class QSIReconExtractor:
     session:
         BIDS session identifier (e.g. ``"ses-20240101"``).
     atlases:
-        List of atlas keys to extract (e.g. ``["schaefer400x7", "tian_s2"]``).
+        List of atlas keys to extract (e.g. ``["4S156Parcels", "schaefer100x7"]``).
     """
 
     def __init__(
@@ -43,98 +60,603 @@ class QSIReconExtractor:
         self.session = session
         self.atlases = atlases
 
-    def extract(self) -> dict[str, str]:
+    # ------------------------------------------------------------------
+    # Public orchestrator
+    # ------------------------------------------------------------------
+
+    def extract(self) -> dict:
         """Run all QSIRecon extractions for this session.
 
         Returns
         -------
         dict
-            Status summary with keys ``atlases_extracted``, ``atlases_skipped``,
-            and ``warnings``.
-
-        Raises
-        ------
-        NotImplementedError
-            Until extraction is implemented.
+            Status summary.
         """
-        raise NotImplementedError(
-            "QSIReconExtractor.extract() is not yet implemented."
-        )
+        warnings: list[str] = []
+        atlases_extracted: list[str] = []
+        atlases_skipped: list[str] = []
+        n_scalar_files = 0
+        n_conn_files = 0
+
+        if not self.qsirecon_dir.exists():
+            msg = f"QSIRecon directory not found: {self.qsirecon_dir}"
+            logger.warning(msg)
+            status = {
+                "subject": self.subject,
+                "session": self.session,
+                "extraction_date": datetime.now().isoformat(),
+                "brainbank_extract_version": __version__,
+                "atlases_extracted": [],
+                "atlases_skipped": self.atlases,
+                "modalities": {
+                    "dwi_scalars": {"status": "error", "n_files": 0},
+                    "dwi_connectivity": {"status": "error", "n_files": 0},
+                    "dwi_tractprofiles": {"status": "skipped", "reason": "no pyAFQ outputs"},
+                },
+                "warnings": [msg],
+            }
+            write_status_json(status, self.output_dir / "_status.json")
+            return status
+
+        # Track which combined atlases have had their connectivity written to
+        # avoid writing the same full matrix multiple times when several
+        # component atlases (e.g. schaefer400x7 + tian_s2) share one combined seg.
+        written_combined_connectivity: set[str] = set()
+
+        for atlas in self.atlases:
+            atlas_ok = False
+
+            # Scalar extraction
+            try:
+                written = self._extract_and_write_scalars(atlas)
+                n_scalar_files += written
+                if written > 0:
+                    atlas_ok = True
+            except Exception as exc:
+                msg = f"Atlas {atlas!r} scalar extraction failed: {exc}"
+                warnings.append(msg)
+                logger.warning(msg)
+
+            # Connectivity extraction
+            try:
+                written = self._extract_and_write_connectivity(
+                    atlas, written_combined_connectivity
+                )
+                n_conn_files += written
+                if written > 0:
+                    atlas_ok = True
+            except Exception as exc:
+                msg = f"Atlas {atlas!r} connectivity extraction failed: {exc}"
+                warnings.append(msg)
+                logger.warning(msg)
+
+            if atlas_ok:
+                atlases_extracted.append(atlas)
+            else:
+                atlases_skipped.append(atlas)
+
+        # Tract profiles (not implemented — pyAFQ outputs not available)
+        tract_profiles = self.extract_tract_profiles()
+
+        status = {
+            "subject": self.subject,
+            "session": self.session,
+            "extraction_date": datetime.now().isoformat(),
+            "brainbank_extract_version": __version__,
+            "atlases_extracted": atlases_extracted,
+            "atlases_skipped": atlases_skipped,
+            "modalities": {
+                "dwi_scalars": {
+                    "status": "complete" if n_scalar_files > 0 else "failed",
+                    "n_files": n_scalar_files,
+                },
+                "dwi_connectivity": {
+                    "status": "complete" if n_conn_files > 0 else "failed",
+                    "n_files": n_conn_files,
+                },
+                "dwi_tractprofiles": {
+                    "status": "complete" if tract_profiles else "skipped",
+                    "reason": "no pyAFQ outputs" if not tract_profiles else None,
+                    "n_tracts": len(tract_profiles),
+                },
+            },
+            "warnings": warnings,
+        }
+        write_status_json(status, self.output_dir / "_status.json")
+        return status
+
+    # ------------------------------------------------------------------
+    # Scalar extraction
+    # ------------------------------------------------------------------
 
     def extract_scalars(self, atlas: str) -> list[pd.DataFrame]:
-        """Discover and standardize parcellated scalar TSVs for a given atlas.
+        """Parcellate scalar dwimap NII files for a given atlas.
 
-        Globs for ``*_parc.tsv`` files, parses BIDS entities from filenames,
-        and copies/renames to the standard output naming convention.
+        Discovers all ``*_model-*_param-*_dwimap.nii.gz`` files across all
+        pipeline subdirectories, loads the atlas segmentation mask, and computes
+        per-parcel statistics (mean, std, median, n_voxels).
+
+        For component atlases (e.g. ``schaefer400x7``), the combined QSIRecon
+        segmentation (e.g. ``Schaefer2018N400n7Tian2020S2``) is used and labels
+        are filtered to only those belonging to this component.
 
         Parameters
         ----------
         atlas:
-            Atlas key from the registry (e.g. ``"schaefer400x7"``).
+            Atlas key from the registry.
 
         Returns
         -------
         list[pd.DataFrame]
-            One DataFrame per (model, param) combination found.
+            One DataFrame per (pipeline, model, param) combination found.
+            Each has columns defined by ``_SCALAR_COLS`` plus ``model``, ``param``,
+            ``pipeline``.
 
         Raises
         ------
-        NotImplementedError
-            Until extraction is implemented.
+        FileNotFoundError
+            If the atlas segmentation NII is not found.
         """
-        raise NotImplementedError(
-            "QSIReconExtractor.extract_scalars() is not yet implemented."
-        )
+        seg_name, label_filter = self._resolve_seg_and_filter(atlas)
+        atlas_path, labels = self._find_atlas_seg(seg_name)
+
+        # Apply label filter for component atlases
+        if label_filter is not None:
+            labels = {idx: lbl for idx, lbl in labels.items() if label_filter(lbl)}
+
+        if not labels:
+            logger.warning(
+                "No labels remain after filtering for atlas %r in seg %r", atlas, seg_name
+            )
+            return []
+
+        # Load atlas segmentation
+        atlas_img = nib.load(str(atlas_path))
+        atlas_data = np.round(atlas_img.get_fdata()).astype(int)
+
+        # Discover all scalar maps across pipelines
+        scalar_maps = self._find_scalar_maps()
+        if not scalar_maps:
+            logger.info("No scalar dwimap files found for subject %s session %s",
+                        self.subject, self.session)
+            return []
+
+        results = []
+        for scalar_path, pipeline, model, param in scalar_maps:
+            try:
+                scalar_img = nib.load(str(scalar_path))
+                scalar_data = scalar_img.get_fdata()
+
+                rows = []
+                for idx, label in sorted(labels.items()):
+                    mask = atlas_data == idx
+                    if not mask.any():
+                        continue
+                    vals = scalar_data[mask]
+                    finite_vals = vals[np.isfinite(vals)]
+                    if len(finite_vals) == 0:
+                        continue
+                    rows.append({
+                        "region_index": idx,
+                        "region_label": label,
+                        "hemisphere": _label_hemisphere(label),
+                        "mean": float(np.mean(finite_vals)),
+                        "std": float(np.std(finite_vals)),
+                        "median": float(np.median(finite_vals)),
+                        "n_voxels": int(mask.sum()),
+                        "model": model,
+                        "param": param,
+                        "pipeline": pipeline,
+                    })
+
+                if rows:
+                    results.append(pd.DataFrame(rows))
+            except Exception as exc:
+                logger.warning("Failed to parcellate %s: %s", scalar_path.name, exc)
+
+        return results
+
+    def _extract_and_write_scalars(self, atlas: str) -> int:
+        """Extract scalars for an atlas and write TSV files. Returns number of files written."""
+        prefix = f"{self.subject}_{self.session}"
+        out_dir = self.output_dir / "dwi" / "scalars"
+
+        dfs = self.extract_scalars(atlas)
+        written = 0
+        for df in dfs:
+            model = df["model"].iloc[0]
+            param = df["param"].iloc[0]
+            fname = (
+                f"{prefix}_atlas-{atlas}_model-{model}_param-{param}"
+                f"_desc-parcellated_diffmetrics.tsv"
+            )
+            out_cols = [c for c in _SCALAR_COLS if c in df.columns]
+            write_tsv(df[out_cols], out_dir / fname)
+            written += 1
+        return written
+
+    # ------------------------------------------------------------------
+    # Connectivity extraction
+    # ------------------------------------------------------------------
 
     def extract_connectivity(
         self,
         atlas: str,
-        measure: str,
+        measure: str = "sift2",
     ) -> tuple[np.ndarray, list[str]]:
-        """Extract a connectivity matrix for a given atlas and measure.
+        """Extract a connectivity matrix for a given atlas.
 
-        Locates the connectivity CSV or npy file, converts to numpy array,
-        verifies symmetry, and generates a companion labels JSON.
+        For component atlases (e.g. ``schaefer400x7``), the full combined
+        segmentation matrix is returned — NOT a sub-matrix — because
+        cross-system connections (cortical↔subcortical) are scientifically
+        meaningful.  The labels returned correspond to all parcels in the
+        combined seg.
 
         Parameters
         ----------
         atlas:
             Atlas key from the registry.
         measure:
-            Connectivity measure: ``"sift2"``, ``"count"``, or ``"meanlength"``.
+            Connectivity measure key to extract from the .mat file.
+            Common keys: ``"sift2"``, ``"count"``, ``"meanlength"``.
 
         Returns
         -------
         matrix : np.ndarray
-            Shape ``(N_parcels, N_parcels)``.
+            Shape ``(N_parcels, N_parcels)``.  For component atlases this is
+            the full combined matrix (e.g. 432×432 for Schaefer400+TianS2).
         labels : list[str]
-            Ordered region labels.
+            Ordered region labels matching matrix rows/columns.
+        combined_atlas_key : str
+            Registry key of the combined atlas whose seg was used.  Equals
+            ``atlas`` when the atlas has its own standalone seg.
 
         Raises
         ------
-        NotImplementedError
-            Until extraction is implemented.
+        FileNotFoundError
+            If no connectivity .mat file is found.
+        KeyError
+            If the measure key is not found in the .mat file.
         """
-        raise NotImplementedError(
-            "QSIReconExtractor.extract_connectivity() is not yet implemented."
-        )
+        seg_name, _ = self._resolve_seg_and_filter(atlas)
+        combined_key = self._combined_atlas_key_for(atlas)
+        _, labels_dict = self._find_atlas_seg(seg_name)
+        labels = [labels_dict[i] for i in sorted(labels_dict)]
+
+        mat_path = self._find_connectivity_mat()
+        mat_data = scipy.io.loadmat(str(mat_path))
+
+        matrix = _extract_mat_matrix(mat_data, measure, expected_size=len(labels))
+
+        return matrix, labels, combined_key
+
+    def _extract_and_write_connectivity(
+        self,
+        atlas: str,
+        written_combined: set[str],
+    ) -> int:
+        """Extract connectivity for an atlas and write .npy + labels JSON.
+
+        For component atlases (e.g. ``schaefer400x7``), the output is written
+        under the combined atlas key (e.g. ``schaefer400x7_tian_s2``) so that
+        the full cross-system matrix is preserved.  If the combined atlas key
+        has already been written in this session (tracked via ``written_combined``),
+        this is a no-op.
+
+        Returns number of files written.
+        """
+        combined_key = self._combined_atlas_key_for(atlas)
+
+        # Avoid writing the same combined matrix more than once per session
+        if combined_key in written_combined:
+            return 0
+
+        prefix = f"{self.subject}_{self.session}"
+        out_dir = self.output_dir / "dwi" / "connectivity"
+
+        seg_name, _ = self._resolve_seg_and_filter(atlas)
+        _, labels_dict = self._find_atlas_seg(seg_name)
+        labels = [labels_dict[i] for i in sorted(labels_dict)]
+
+        mat_path = self._find_connectivity_mat()
+        mat_data = scipy.io.loadmat(str(mat_path))
+
+        # Find all square matrices in the .mat file
+        matrices = _find_all_matrices(mat_data, expected_size=len(labels))
+        written = 0
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for measure, matrix in matrices.items():
+            npy_name = f"{prefix}_atlas-{combined_key}_desc-{measure}_connmatrix.npy"
+            labels_name = f"{prefix}_atlas-{combined_key}_desc-{measure}_connmatrix-labels.json"
+            np.save(str(out_dir / npy_name), matrix)
+            (out_dir / labels_name).write_text(json.dumps(labels, indent=2))
+            written += 2  # .npy + labels JSON
+
+        if written:
+            written_combined.add(combined_key)
+
+        return written
+
+    # ------------------------------------------------------------------
+    # Tract profiles
+    # ------------------------------------------------------------------
 
     def extract_tract_profiles(self) -> list[pd.DataFrame]:
         """Extract pyAFQ tract profiles if present.
 
-        Checks for pyAFQ output directory, locates per-tract profile files,
-        and standardizes column names.
+        Returns an empty list — pyAFQ tract profile CSVs are not yet available
+        in the current pipeline outputs.
+        """
+        return []
 
-        Returns
-        -------
-        list[pd.DataFrame]
-            One DataFrame per tract. Empty list if no pyAFQ outputs found.
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_seg_and_filter(
+        self,
+        atlas: str,
+    ) -> tuple[str, Any]:
+        """Return ``(qsirecon_seg_name, label_filter)`` for an atlas.
+
+        For atlases with a direct ``qsirecon_seg_name`` (combined, standalone
+        volumetric), returns ``(seg_name, None)`` — all labels are used.
+
+        For component atlases (surface Schaefer, volumetric Tian without a
+        standalone seg), finds the first available combined atlas on disk and
+        returns its seg name together with the appropriate label-filter callable.
 
         Raises
         ------
-        NotImplementedError
-            Until extraction is implemented.
+        FileNotFoundError
+            If the atlas has no standalone seg and no combined atlas is found.
+        ValueError
+            If the atlas has no QSIRecon representation at all.
         """
-        raise NotImplementedError(
-            "QSIReconExtractor.extract_tract_profiles() is not yet implemented."
+        meta = get_atlas(atlas)
+
+        # Atlas has its own seg file
+        if "qsirecon_seg_name" in meta:
+            return meta["qsirecon_seg_name"], None
+
+        # Atlas is a component — find available combined atlas on disk
+        combined_keys = get_containing_combined_atlases(atlas)
+        if not combined_keys:
+            raise ValueError(
+                f"Atlas {atlas!r} has no qsirecon_seg_name and no qsirecon_component_of — "
+                "cannot extract from QSIRecon outputs."
+            )
+
+        dwi_dir = self._session_dwi_dir()
+        for combined_key in combined_keys:
+            combined_meta = get_atlas(combined_key)
+            seg_name = combined_meta.get("qsirecon_seg_name", "")
+            candidates = list(dwi_dir.glob(f"*_seg-{seg_name}_dseg.nii.gz")) if dwi_dir.exists() else []
+            if candidates:
+                label_filter = build_label_filter(atlas)
+                return seg_name, label_filter
+
+        # None found — raise with helpful message
+        tried = [get_atlas(k).get("qsirecon_seg_name", k) for k in combined_keys]
+        raise FileNotFoundError(
+            f"No combined atlas segmentation found for {atlas!r}. "
+            f"Tried seg names: {tried} in {dwi_dir}"
         )
+
+    def _combined_atlas_key_for(self, atlas: str) -> str:
+        """Return the registry key used to name connectivity output files.
+
+        For a direct atlas (has ``qsirecon_seg_name``), returns ``atlas`` itself.
+        For a component atlas, returns the first available combined atlas key.
+        """
+        meta = get_atlas(atlas)
+        if "qsirecon_seg_name" in meta:
+            return atlas
+
+        combined_keys = get_containing_combined_atlases(atlas)
+        dwi_dir = self._session_dwi_dir()
+        for combined_key in combined_keys:
+            combined_meta = get_atlas(combined_key)
+            seg_name = combined_meta.get("qsirecon_seg_name", "")
+            candidates = list(dwi_dir.glob(f"*_seg-{seg_name}_dseg.nii.gz")) if dwi_dir.exists() else []
+            if candidates:
+                return combined_key
+
+        # Fall back to first combined key (will fail at seg lookup stage anyway)
+        return combined_keys[0] if combined_keys else atlas
+
+    def _session_dwi_dir(self) -> Path:
+        """Return the main session dwi directory (contains atlas dseg files)."""
+        return self.qsirecon_dir / self.subject / self.session / "dwi"
+
+    def _find_atlas_seg(self, seg_name: str) -> tuple[Path, dict[int, str]]:
+        """Find the atlas segmentation NII and its label file.
+
+        Searches in ``{qsirecon_dir}/{subject}/{session}/dwi/``.
+        Prefers files without ``dir-AP`` prefix.
+
+        Returns
+        -------
+        atlas_path : Path
+        labels : dict[int, str]
+            Maps integer label index → region label string.
+        """
+        dwi_dir = self._session_dwi_dir()
+        if not dwi_dir.exists():
+            raise FileNotFoundError(f"QSIRecon session dwi dir not found: {dwi_dir}")
+
+        candidates = sorted(dwi_dir.glob(f"*_seg-{seg_name}_dseg.nii.gz"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No atlas segmentation found for seg_name={seg_name!r} in {dwi_dir}"
+            )
+        no_dirap = [p for p in candidates if "dir-AP" not in p.name]
+        atlas_path = no_dirap[0] if no_dirap else candidates[0]
+
+        label_path = atlas_path.with_suffix("").with_suffix(".txt")
+        if not label_path.exists():
+            label_path = Path(str(atlas_path).replace("_dseg.nii.gz", "_dseg.txt"))
+        if not label_path.exists():
+            raise FileNotFoundError(f"Label file not found for {atlas_path}")
+
+        labels = _parse_dseg_txt(label_path)
+        return atlas_path, labels
+
+    def _find_scalar_maps(self) -> list[tuple[Path, str, str, str]]:
+        """Glob for all scalar dwimap NII files across all pipeline subdirs.
+
+        Returns
+        -------
+        list of (path, pipeline_name, model, param)
+        """
+        derivatives_dir = self.qsirecon_dir / "derivatives"
+        if not derivatives_dir.exists():
+            return []
+
+        found: dict[tuple[str, str, str], tuple[Path, str]] = {}
+
+        for pipeline_dir in sorted(derivatives_dir.glob("qsirecon-*")):
+            pipeline_name = pipeline_dir.name.replace("qsirecon-", "")
+            session_dwi = pipeline_dir / self.subject / self.session / "dwi"
+            if not session_dwi.exists():
+                continue
+
+            for nii_path in sorted(session_dwi.glob("*_model-*_param-*_dwimap.nii.gz")):
+                model, param = _parse_model_param(nii_path.name)
+                if model is None or param is None:
+                    continue
+                key = (pipeline_name, model, param)
+                if key not in found or "dir-AP" not in nii_path.name:
+                    found[key] = (nii_path, pipeline_name)
+
+        return [(path, pipeline, model, param) for (pipeline, model, param), (path, _) in found.items()]
+
+    def _find_connectivity_mat(self) -> Path:
+        """Find the MRtrix3 connectivity .mat file for this session."""
+        mrtrix_pipeline = self.qsirecon_dir / "derivatives" / "qsirecon-MRtrix3_act-HSVS"
+        session_dwi = mrtrix_pipeline / self.subject / self.session / "dwi"
+
+        candidates: list[Path] = []
+        if session_dwi.exists():
+            candidates = sorted(session_dwi.glob("*_connectivity.mat"))
+
+        if not candidates:
+            derivatives_dir = self.qsirecon_dir / "derivatives"
+            if derivatives_dir.exists():
+                for pipeline_dir in sorted(derivatives_dir.glob("qsirecon-*")):
+                    sd = pipeline_dir / self.subject / self.session / "dwi"
+                    if sd.exists():
+                        candidates.extend(sorted(sd.glob("*_connectivity.mat")))
+
+        if not candidates:
+            raise FileNotFoundError(
+                f"No connectivity .mat file found for {self.subject}/{self.session}"
+            )
+
+        no_dirap = [p for p in candidates if "dir-AP" not in p.name]
+        return no_dirap[0] if no_dirap else candidates[0]
+
+
+# ------------------------------------------------------------------
+# Module-level helpers
+# ------------------------------------------------------------------
+
+def _parse_dseg_txt(label_path: Path) -> dict[int, str]:
+    """Parse a ``*_dseg.txt`` file into a dict of index → label name.
+
+    File format (tab-separated)::
+
+        1\\tLH_Vis_1
+        2\\tLH_Vis_2
+        ...
+    """
+    labels: dict[int, str] = {}
+    with open(label_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                try:
+                    idx = int(parts[0])
+                    name = parts[1].strip()
+                    labels[idx] = name
+                except (ValueError, IndexError):
+                    continue
+    return labels
+
+
+def _parse_model_param(filename: str) -> tuple[str | None, str | None]:
+    """Extract model and param BIDS entities from a dwimap filename."""
+    import re
+    model_m = re.search(r"_model-([^_]+)", filename)
+    param_m = re.search(r"_param-([^_]+)", filename)
+    model = model_m.group(1) if model_m else None
+    param = param_m.group(1) if param_m else None
+    return model, param
+
+
+def _label_hemisphere(label: str) -> str:
+    """Infer hemisphere from a region label string."""
+    upper = label.upper()
+    if upper.startswith("LH_") or "_LH_" in upper or upper.endswith("-LH"):
+        return "L"
+    if upper.startswith("RH_") or "_RH_" in upper or upper.endswith("-RH"):
+        return "R"
+    return "bilateral"
+
+
+def _extract_mat_matrix(
+    mat_data: dict,
+    measure: str,
+    expected_size: int,
+) -> np.ndarray:
+    """Extract a named square matrix from a loaded .mat file dict."""
+    if measure in mat_data:
+        arr = np.array(mat_data[measure], dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+            return arr
+
+    for key, val in mat_data.items():
+        if key.startswith("_"):
+            continue
+        if key.lower() == measure.lower():
+            arr = np.array(val, dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+                return arr
+
+    for key, val in mat_data.items():
+        if key.startswith("_"):
+            continue
+        try:
+            arr = np.array(val, dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[0] == arr.shape[1] == expected_size:
+                return arr
+        except (ValueError, TypeError):
+            continue
+
+    raise KeyError(
+        f"Measure {measure!r} not found in .mat file. "
+        f"Available keys: {[k for k in mat_data if not k.startswith('_')]}"
+    )
+
+
+def _find_all_matrices(
+    mat_data: dict,
+    expected_size: int,
+) -> dict[str, np.ndarray]:
+    """Return all square matrices from a .mat file, keyed by their variable name."""
+    result: dict[str, np.ndarray] = {}
+    for key, val in mat_data.items():
+        if key.startswith("_"):
+            continue
+        try:
+            arr = np.array(val, dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+                if expected_size <= 0 or arr.shape[0] == expected_size:
+                    result[key] = arr
+        except (ValueError, TypeError):
+            continue
+    return result

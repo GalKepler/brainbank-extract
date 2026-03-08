@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 import click
 
@@ -12,13 +14,20 @@ import click
     "--freesurfer-dir",
     type=click.Path(),
     default=None,
-    help="Path to the FreeSurfer subject/session directory.",
+    help=(
+        "Path to the FreeSurfer subject/session directory "
+        "(flat layout: sub-XXX_ses-XXX/ containing surf/, label/, stats/)."
+    ),
 )
 @click.option(
     "--qsirecon-dir",
     type=click.Path(),
     default=None,
-    help="Path to the QSIRecon subject/session directory.",
+    help=(
+        "Path to the **root** QSIRecon derivatives directory "
+        "(contains sub-*/ses-*/dwi/ and derivatives/qsirecon-*/). "
+        "Do NOT point to a session-level directory."
+    ),
 )
 @click.option(
     "--output-dir",
@@ -60,11 +69,11 @@ def extract(
 
     \b
         bb-extract \\
-          --freesurfer-dir /derivatives/freesurfer/sub-001/ses-20240101 \\
-          --qsirecon-dir /derivatives/qsirecon/sub-001/ses-20240101 \\
+          --freesurfer-dir /derivatives/freesurfer/sub-001_ses-20240101 \\
+          --qsirecon-dir /derivatives/qsirecon \\
           --output-dir /derivatives/brainbank-extract/sub-001/ses-20240101 \\
           --atlases schaefer400x7 \\
-          --atlases tian_s2 \\
+          --atlases 4S156Parcels \\
           --subject sub-001 \\
           --session ses-20240101
     """
@@ -75,14 +84,53 @@ def extract(
         )
         sys.exit(1)
 
-    click.echo("bb-extract: not yet implemented.")
-    click.echo(f"  subject:       {subject}")
-    click.echo(f"  session:       {session}")
-    click.echo(f"  freesurfer:    {freesurfer_dir}")
-    click.echo(f"  qsirecon:      {qsirecon_dir}")
-    click.echo(f"  output:        {output_dir}")
-    click.echo(f"  atlases:       {', '.join(atlases)}")
-    sys.exit(0)
+    out_path = Path(output_dir)
+    atlas_list = list(atlases)
+    combined_status: dict = {}
+
+    # FreeSurfer extraction
+    if freesurfer_dir is not None:
+        from brainbank_extract.extractors.freesurfer import FreeSurferExtractor
+
+        fs_extractor = FreeSurferExtractor(
+            freesurfer_dir=Path(freesurfer_dir),
+            output_dir=out_path,
+            subject=subject,
+            session=session,
+            atlases=atlas_list,
+        )
+        click.echo(f"Extracting FreeSurfer features from: {freesurfer_dir}")
+        fs_status = fs_extractor.extract()
+        combined_status["freesurfer"] = fs_status
+        anat_n = fs_status.get("modalities", {}).get("anat", {}).get("n_files", 0)
+        click.echo(f"  anat: {anat_n} file(s) written")
+        if fs_status.get("warnings"):
+            for w in fs_status["warnings"]:
+                click.echo(f"  WARNING: {w}", err=True)
+
+    # QSIRecon extraction
+    if qsirecon_dir is not None:
+        from brainbank_extract.extractors.qsirecon import QSIReconExtractor
+
+        qsi_extractor = QSIReconExtractor(
+            qsirecon_dir=Path(qsirecon_dir),
+            output_dir=out_path,
+            subject=subject,
+            session=session,
+            atlases=atlas_list,
+        )
+        click.echo(f"Extracting QSIRecon features from: {qsirecon_dir}")
+        qsi_status = qsi_extractor.extract()
+        combined_status["qsirecon"] = qsi_status
+        dwi_scalars_n = qsi_status.get("modalities", {}).get("dwi_scalars", {}).get("n_files", 0)
+        dwi_conn_n = qsi_status.get("modalities", {}).get("dwi_connectivity", {}).get("n_files", 0)
+        click.echo(f"  dwi scalars: {dwi_scalars_n} file(s) written")
+        click.echo(f"  dwi connectivity: {dwi_conn_n} file(s) written")
+        if qsi_status.get("warnings"):
+            for w in qsi_status["warnings"]:
+                click.echo(f"  WARNING: {w}", err=True)
+
+    click.echo("Done.")
 
 
 @click.command("bb-aggregate")
