@@ -209,10 +209,12 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
         "qsirecon_index_range": [1, 246],
     },
     # Brainnetome246 subcortical component (10 parcels, indices 248–257)
+    # Stats file on disk is BN_Atlas_subcotex.stats (note: misspelling in FreeSurfer pipeline)
     "brainnetome246_subcortical": {
         "full_name": "Brainnetome246Ext subcortical component (10 parcels)",
         "type": "volumetric",
         "n_parcels": 10,
+        "fsatlas_name": "BN_Atlas_subcotex",
         "qsirecon_component_of": ["brainnetome246ext"],
         "qsirecon_index_range": [248, 257],
     },

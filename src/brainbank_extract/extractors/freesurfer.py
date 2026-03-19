@@ -334,8 +334,15 @@ class FreeSurferExtractor:
             return _fsatlas_cortical_to_brainbank(df)
 
         # -- Volumetric atlas --
-        # Approach 2: try parsing existing stats file directly
-        stats_path = self.freesurfer_dir / "stats" / f"{fsatlas_name}.subcortical.stats"
+        # Approach 2: try parsing existing stats file directly.
+        # Check both the standard name ({name}.subcortical.stats) and the
+        # bare name ({name}.stats) — some atlases (e.g. BN_Atlas_subcotex) use
+        # the latter convention.
+        stats_candidates = [
+            self.freesurfer_dir / "stats" / f"{fsatlas_name}.subcortical.stats",
+            self.freesurfer_dir / "stats" / f"{fsatlas_name}.stats",
+        ]
+        stats_path = next((p for p in stats_candidates if p.exists()), stats_candidates[0])
         if stats_path.exists():
             result = _parse_volumetric_stats_file(stats_path)
             if result is not None:
