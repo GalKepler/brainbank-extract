@@ -52,6 +52,15 @@ import click
     required=True,
     help="BIDS session identifier (e.g. ses-20240101).",
 )
+@click.option(
+    "--qsirecon-atlases-dir",
+    type=click.Path(),
+    default=None,
+    help=(
+        "Path to the QSIRecon atlases directory containing atlas-*/ subdirectories. "
+        "Reserved for future subcortical volumetric extraction from Ext combined atlases."
+    ),
+)
 @click.version_option(package_name="brainbank-extract")
 def extract(
     freesurfer_dir: str | None,
@@ -60,6 +69,7 @@ def extract(
     atlases: tuple[str, ...],
     subject: str,
     session: str,
+    qsirecon_atlases_dir: str | None,
 ) -> None:
     """Extract neuroimaging features for a single subject/session.
 
