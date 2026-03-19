@@ -204,7 +204,7 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
         "full_name": "Brainnetome Atlas, 246 cortical parcels",
         "type": "surface",
         "n_parcels": 246,
-        "fsatlas_name": "brainnetome246",
+        "fsatlas_name": "BN_Atlas",
         "qsirecon_component_of": ["brainnetome246ext"],
         "qsirecon_index_range": [1, 246],
     },
