@@ -595,9 +595,9 @@ def _infer_hemisphere(struct_name: str) -> str:
     """
     name = struct_name.lower()
     # Prefix patterns (aseg, some cortical atlases)
-    if name.startswith(("left-", "left_", "lh.", "lh-", "lh_")):
+    if name.startswith(("left-", "left_", "lh.", "lh-", "lh_", "l-", "l_")):
         return "L"
-    if name.startswith(("right-", "right_", "rh.", "rh-", "rh_")):
+    if name.startswith(("right-", "right_", "rh.", "rh-", "rh_", "r-", "r_")):
         return "R"
     # Infix patterns
     if "-lh-" in name or "_lh_" in name:
