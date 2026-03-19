@@ -360,3 +360,156 @@ def mock_extract_dir(tmp_path: Path) -> Path:
         (session_dir / "_status.json").write_text(json.dumps(status, indent=2))
 
     return extract_dir
+
+
+# ---------------------------------------------------------------------------
+# Aggregator fixtures: extract dirs populated with real output files
+# ---------------------------------------------------------------------------
+
+_SESSIONS = [
+    ("sub-001", "ses-20240101"),
+    ("sub-001", "ses-20240601"),
+    ("sub-002", "ses-20240101"),
+]
+
+_ANAT_REGIONS = [
+    {"region_index": 1, "region_label": "superiorfrontal", "hemisphere": "L"},
+    {"region_index": 2, "region_label": "middlefrontal", "hemisphere": "L"},
+    {"region_index": 3, "region_label": "precentral", "hemisphere": "R"},
+]
+
+_SCALAR_REGIONS = [
+    {"region_index": 1, "region_label": "LH_Vis_1", "hemisphere": "L"},
+    {"region_index": 2, "region_label": "LH_Vis_2", "hemisphere": "L"},
+    {"region_index": 3, "region_label": "RH_Vis_1", "hemisphere": "R"},
+    {"region_index": 4, "region_label": "RH_Vis_2", "hemisphere": "R"},
+]
+
+_CONN_LABELS = ["LH_Vis_1", "LH_Vis_2", "RH_Vis_1", "RH_Vis_2", "HIP-lh", "HIP-rh"]
+
+
+def _write_session_status(session_dir: Path, subject: str, session: str) -> None:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    status = {
+        "subject": subject,
+        "session": session,
+        "extraction_date": "2026-03-08T12:00:00",
+        "brainbank_extract_version": "0.1.0",
+        "atlases_extracted": ["desikan"],
+        "atlases_skipped": [],
+        "modalities": {"anat": {"status": "complete", "n_files": 5}},
+        "warnings": [],
+    }
+    (session_dir / "_status.json").write_text(json.dumps(status, indent=2))
+
+
+@pytest.fixture
+def mock_extract_dir_with_anat(tmp_path: Path) -> Path:
+    """Extract dir with populated anat TSV files for 3 sessions."""
+    extract_dir = tmp_path / "brainbank-extract"
+    rng = np.random.default_rng(0)
+
+    for subject, session in _SESSIONS:
+        prefix = f"{subject}_{session}"
+        session_dir = extract_dir / subject / session
+        anat_dir = session_dir / "anat"
+        anat_dir.mkdir(parents=True)
+        _write_session_status(session_dir, subject, session)
+
+        # Global metrics
+        global_rows = [
+            {"metric": "eTIV", "value": float(rng.uniform(1.4e6, 1.6e6)), "source": "freesurfer"},
+            {"metric": "BrainSegVol", "value": float(rng.uniform(1.1e6, 1.3e6)), "source": "freesurfer"},
+            {"metric": "lhCortexVol", "value": float(rng.uniform(2.4e5, 2.6e5)), "source": "freesurfer"},
+        ]
+        import pandas as pd
+        pd.DataFrame(global_rows).to_csv(
+            anat_dir / f"{prefix}_desc-globalmetrics_morph.tsv", sep="\t", index=False
+        )
+
+        # Desikan thickness + area
+        atlas_dir = anat_dir / "atlas-desikan"
+        atlas_dir.mkdir(parents=True)
+        for metric in ("thickness", "area"):
+            rows = [
+                {**r, "value": float(rng.uniform(1.5, 4.0)), "metric": metric}
+                for r in _ANAT_REGIONS
+            ]
+            pd.DataFrame(rows).to_csv(
+                atlas_dir / f"{prefix}_atlas-desikan_desc-{metric}_morph.tsv",
+                sep="\t", index=False,
+            )
+
+    return extract_dir
+
+
+@pytest.fixture
+def mock_extract_dir_with_dwi_scalars(tmp_path: Path) -> Path:
+    """Extract dir with populated scalar TSV files for 3 sessions."""
+    extract_dir = tmp_path / "brainbank-extract"
+    rng = np.random.default_rng(1)
+
+    for subject, session in _SESSIONS:
+        prefix = f"{subject}_{session}"
+        session_dir = extract_dir / subject / session
+        _write_session_status(session_dir, subject, session)
+
+        out_dir = (
+            session_dir / "dwi" / "scalars"
+            / "pipeline-DIPYDKI" / "atlas-schaefer100x7"
+        )
+        out_dir.mkdir(parents=True)
+
+        import pandas as pd
+        rows = [
+            {
+                **r,
+                "mean": float(rng.uniform(0.3, 0.7)),
+                "std": float(rng.uniform(0.01, 0.1)),
+                "median": float(rng.uniform(0.3, 0.7)),
+                "n_voxels": int(rng.integers(50, 200)),
+                "model": "dkimicro",
+                "param": "fa",
+                "pipeline": "DIPYDKI",
+            }
+            for r in _SCALAR_REGIONS
+        ]
+        fname = (
+            f"{prefix}_atlas-schaefer100x7_pipeline-DIPYDKI"
+            f"_model-dkimicro_param-fa_desc-parcellated_diffmetrics.tsv"
+        )
+        pd.DataFrame(rows).to_csv(out_dir / fname, sep="\t", index=False)
+
+    return extract_dir
+
+
+@pytest.fixture
+def mock_extract_dir_with_connectivity(tmp_path: Path) -> Path:
+    """Extract dir with populated connectivity .npy + labels JSON for 3 sessions."""
+    extract_dir = tmp_path / "brainbank-extract"
+    rng = np.random.default_rng(2)
+    n = len(_CONN_LABELS)
+
+    for subject, session in _SESSIONS:
+        prefix = f"{subject}_{session}"
+        session_dir = extract_dir / subject / session
+        _write_session_status(session_dir, subject, session)
+
+        out_dir = (
+            session_dir / "dwi" / "connectivity"
+            / "pipeline-MRtrix3_act-HSVS" / "atlas-schaefer100x7_tian_s1"
+        )
+        out_dir.mkdir(parents=True)
+
+        raw = rng.integers(0, 100, size=(n, n)).astype(np.float64)
+        matrix = (raw + raw.T) / 2.0
+        np.fill_diagonal(matrix, 0)
+
+        base = (
+            f"{prefix}_atlas-schaefer100x7_tian_s1"
+            f"_pipeline-MRtrix3_act-HSVS_desc-sift2_connmatrix"
+        )
+        np.save(str(out_dir / f"{base}.npy"), matrix)
+        (out_dir / f"{base}-labels.json").write_text(json.dumps(_CONN_LABELS, indent=2))
+
+    return extract_dir

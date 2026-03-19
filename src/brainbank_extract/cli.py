@@ -384,9 +384,19 @@ def aggregate(
           --modalities anat \\
           --modalities dwi
     """
-    click.echo("bb-aggregate: not yet implemented.")
-    click.echo(f"  extract-dir:   {extract_dir}")
-    click.echo(f"  output-dir:    {output_dir}")
-    click.echo(f"  modalities:    {', '.join(modalities)}")
-    click.echo(f"  force:         {force}")
-    sys.exit(0)
+    from brainbank_extract.aggregator import Aggregator
+
+    try:
+        agg = Aggregator(
+            extract_dir=Path(extract_dir),
+            output_dir=Path(output_dir),
+            modalities=list(modalities),
+            force=force,
+        )
+        summary = agg.run()
+        click.echo(
+            f"Aggregation complete. Processed {summary['new_sessions']} new session(s)."
+        )
+    except Exception as exc:
+        click.echo(f"Error during aggregation: {exc}", err=True)
+        sys.exit(1)
