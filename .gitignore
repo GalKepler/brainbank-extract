@@ -16,3 +16,5 @@ htmlcov/
 
 /data
 !/src/brainbank_extract/data
+plans
+tmp.ipynb
