@@ -16,6 +16,8 @@ dependencies = [
     "pyarrow>=14.0",
     "click>=8.0",
     "scipy>=1.10",
+    "fsatlas @ file:///home/galkepler/Projects/fsatlas",
+    "parcellate @ file:///home/galkepler/Projects/parcellate",
 ]
 
 [project.optional-dependencies]
@@ -31,5 +33,14 @@ bb-aggregate = "brainbank_extract.cli:aggregate"
 [tool.hatch.build.targets.wheel]
 packages = ["src/brainbank_extract"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+]

@@ -7,8 +7,6 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-import nibabel.freesurfer.io as fsio
-import numpy as np
 import pandas as pd
 
 from brainbank_extract import __version__
@@ -16,25 +14,6 @@ from brainbank_extract.atlases import get_atlas
 from brainbank_extract.io import write_status_json, write_tsv
 
 logger = logging.getLogger(__name__)
-
-# Metrics extracted from per-vertex surface files.
-# area is summed per parcel; all others are meaned.
-_SURFACE_METRICS: dict[str, str] = {
-    "thickness": "thickness",
-    "area": "area",
-    "curvature": "curv",
-    "sulc": "sulc",
-}
-
-# Mapping from stats-file column name → output metric key
-# Columns in FreeSurfer surface stats files:
-# StructName NumVert SurfArea GrayVol ThickAvg ThickStd MeanCurv GausCurv FoldInd CurvInd
-_STATS_COL_TO_METRIC: dict[str, str] = {
-    "SurfArea": "area",
-    "GrayVol": "volume",
-    "ThickAvg": "thickness",
-    "MeanCurv": "curvature",
-}
 
 # Short measure names in aseg.stats header → output metric key
 _GLOBAL_MEASURE_MAP: dict[str, str] = {
@@ -48,11 +27,25 @@ _GLOBAL_MEASURE_MAP: dict[str, str] = {
     "EstimatedTotalIntraCranialVol": "eTIV",
 }
 
-# Region names to skip when parcellating (FreeSurfer pseudo-labels)
-_SKIP_REGIONS = frozenset({"unknown", "corpuscallosum", "medialwall"})
+# fsatlas cortical measure names → brainbank metric names
+_FSATLAS_MEASURE_MAP: dict[str, str] = {
+    "thickness_mean_mm": "thickness",
+    "surface_area_mm2": "area",
+    "gray_matter_volume_mm3": "volume",
+    "mean_curvature": "curvature",
+}
 
-# Substrings that mark pseudo-regions to skip in stats files
-_SKIP_SUBSTRINGS = ("FreeSurfer_Defined_Medial_Wall", "Background", "Medial_Wall")
+# fsatlas volumetric measure names → brainbank metric names
+_FSATLAS_VOLUMETRIC_MEASURE_MAP: dict[str, str] = {
+    "volume_mm3": "volume",
+}
+
+# fsatlas hemisphere labels → brainbank hemisphere codes
+_FSATLAS_HEMI_MAP: dict[str, str] = {
+    "lh": "L",
+    "rh": "R",
+    "bilateral": "bilateral",
+}
 
 
 class FreeSurferExtractor:
@@ -136,7 +129,7 @@ class FreeSurferExtractor:
         if "aseg" in self.atlases:
             try:
                 df = self.extract_aseg()
-                write_tsv(df, anat_dir / f"{prefix}_atlas-aseg_desc-subcortical_morph.tsv")
+                write_tsv(df, anat_dir / "atlas-dseg" / f"{prefix}_atlas-aseg_desc-subcortical_morph.tsv")
                 atlases_extracted.append("aseg")
                 n_files += 1
             except Exception as exc:
@@ -144,12 +137,10 @@ class FreeSurferExtractor:
                 warnings.append(f"aseg extraction failed: {exc}")
                 logger.warning("aseg extraction failed: %s", exc)
 
-        # Surface atlases: try stats-file path first, fall back to per-vertex
+        # Surface and combined atlases via fsatlas
         for atlas in self.atlases:
             if atlas == "aseg":
                 continue
-            atlas_files_written = 0
-            atlas_missing = False
 
             try:
                 atlas_meta = get_atlas(atlas)
@@ -158,50 +149,62 @@ class FreeSurferExtractor:
                 warnings.append(f"Atlas '{atlas}' not found in registry")
                 continue
 
-            # Try stats-file extraction (primary path)
-            stats_pattern = atlas_meta.get("freesurfer_stats_pattern")
-            if stats_pattern is not None:
+            has_components = (
+                atlas_meta.get("type") == "combined"
+                and "components" in atlas_meta
+            )
+            fsatlas_name = atlas_meta.get("fsatlas_name")
+
+            if has_components:
+                # Combined atlas: extract each component that has an fsatlas_name
+                atlas_files_written = 0
                 try:
-                    metrics_dict = self.extract_surface_stats(atlas)
+                    component_results = self._extract_combined_atlas(atlas)
+                    for (component_key, metric), df in component_results.items():
+                        fname = f"{prefix}_atlas-{component_key}_desc-{metric}_morph.tsv"
+                        write_tsv(df, anat_dir / f"atlas-{component_key}" / fname)
+                        atlas_files_written += 1
+                        n_files += 1
+                        if component_key not in atlases_extracted:
+                            atlases_extracted.append(component_key)
+                    if atlas_files_written > 0 and atlas not in atlases_extracted:
+                        atlases_extracted.append(atlas)
+                    elif atlas_files_written == 0:
+                        atlases_skipped.append(atlas)
+                        warnings.append(
+                            f"Atlas '{atlas}' combined extraction produced no output"
+                        )
+                except Exception as exc:
+                    atlases_skipped.append(atlas)
+                    warnings.append(f"Atlas '{atlas}' combined extraction failed: {exc}")
+                    logger.warning("Atlas '%s' combined extraction failed: %s", atlas, exc)
+
+            elif fsatlas_name is not None:
+                # Direct surface or volumetric atlas via fsatlas
+                atlas_files_written = 0
+                try:
+                    metrics_dict = self._extract_with_fsatlas(atlas)
                     for metric, df in metrics_dict.items():
                         fname = f"{prefix}_atlas-{atlas}_desc-{metric}_morph.tsv"
-                        write_tsv(df, anat_dir / fname)
+                        write_tsv(df, anat_dir / f"atlas-{atlas}" / fname)
                         atlas_files_written += 1
                         n_files += 1
                     if atlas_files_written > 0:
                         atlases_extracted.append(atlas)
-                    continue  # skip per-vertex fallback if stats worked
-                except FileNotFoundError as exc:
-                    msg = f"Atlas {atlas!r} stats file not found, trying per-vertex: {exc}"
-                    warnings.append(msg)
-                    logger.info(msg)
+                    else:
+                        atlases_skipped.append(atlas)
+                        warnings.append(f"Atlas '{atlas}' produced no output from fsatlas")
                 except Exception as exc:
-                    msg = f"Atlas {atlas!r} stats extraction failed: {exc}"
-                    warnings.append(msg)
-                    logger.warning(msg)
+                    atlases_skipped.append(atlas)
+                    warnings.append(f"Atlas '{atlas}' extraction failed: {exc}")
+                    logger.warning("Atlas '%s' extraction failed: %s", atlas, exc)
 
-            # Fall back to per-vertex parcellation
-            for metric in _SURFACE_METRICS:
-                try:
-                    df = self.extract_surface_morphometrics(atlas, metric)
-                    fname = f"{prefix}_atlas-{atlas}_desc-{metric}_morph.tsv"
-                    write_tsv(df, anat_dir / fname)
-                    atlas_files_written += 1
-                    n_files += 1
-                except FileNotFoundError as exc:
-                    msg = f"Atlas {atlas!r} metric {metric!r} skipped: {exc}"
-                    warnings.append(msg)
-                    logger.warning(msg)
-                    atlas_missing = True
-                except Exception as exc:
-                    msg = f"Atlas {atlas!r} metric {metric!r} failed: {exc}"
-                    warnings.append(msg)
-                    logger.warning(msg)
-
-            if atlas_files_written > 0:
-                atlases_extracted.append(atlas)
-            elif atlas_missing:
+            else:
                 atlases_skipped.append(atlas)
+                warnings.append(
+                    f"Atlas '{atlas}' has no fsatlas_name and no decomposable components"
+                    " — skipping FreeSurfer extraction"
+                )
 
         status = {
             "subject": self.subject,
@@ -222,7 +225,143 @@ class FreeSurferExtractor:
         return status
 
     # ------------------------------------------------------------------
-    # Stats file parsers
+    # Combined atlas extraction
+    # ------------------------------------------------------------------
+
+    def _extract_combined_atlas(
+        self, atlas: str
+    ) -> dict[tuple[str, str], pd.DataFrame]:
+        """Extract morphometrics for a combined atlas by decomposing into components.
+
+        For each component of the combined atlas that has an ``fsatlas_name``,
+        calls :meth:`_extract_with_fsatlas` to extract its morphometrics.
+        Components without an ``fsatlas_name`` (e.g. subcortical-only) are
+        skipped with an info log — they require volumetric NIfTI extraction
+        which is not yet implemented.
+
+        Parameters
+        ----------
+        atlas:
+            Registry key of the combined atlas (must have ``"components"`` field).
+
+        Returns
+        -------
+        dict[tuple[str, str], pd.DataFrame]
+            Keys are ``(component_key, metric_name)`` tuples. Each value is a
+            DataFrame with columns:
+            ``region_index``, ``region_label``, ``hemisphere``, ``value``, ``metric``.
+        """
+        atlas_meta = get_atlas(atlas)
+        components = atlas_meta.get("components", {})
+        result: dict[tuple[str, str], pd.DataFrame] = {}
+
+        for component_key in components:
+            try:
+                component_meta = get_atlas(component_key)
+            except KeyError:
+                logger.warning(
+                    "Combined atlas '%s' references unknown component '%s', skipping",
+                    atlas, component_key,
+                )
+                continue
+
+            if not component_meta.get("fsatlas_name"):
+                logger.info(
+                    "Component '%s' of atlas '%s' has no fsatlas_name — "
+                    "skipping FreeSurfer extraction (requires volumetric NIfTI path)",
+                    component_key, atlas,
+                )
+                continue
+
+            try:
+                metrics_dict = self._extract_with_fsatlas(component_key)
+                for metric, df in metrics_dict.items():
+                    result[(component_key, metric)] = df
+            except Exception as exc:
+                logger.warning(
+                    "Component '%s' extraction failed: %s", component_key, exc
+                )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # fsatlas-based extraction
+    # ------------------------------------------------------------------
+
+    def _extract_with_fsatlas(self, atlas: str) -> dict[str, pd.DataFrame]:
+        """Extract morphometrics using fsatlas.
+
+        For volumetric atlases, first tries to parse an existing
+        ``.subcortical.stats`` file directly.  Falls back to running fsatlas
+        (ensuring the atlas data is downloaded and forcing regeneration when
+        the stats file contains generic ``Seg####`` region names).
+
+        Parameters
+        ----------
+        atlas:
+            Atlas key from the registry (must have ``fsatlas_name``).
+
+        Returns
+        -------
+        dict[str, pd.DataFrame]
+            Keys are metric names. Each DataFrame has columns:
+            ``region_index``, ``region_label``, ``hemisphere``, ``value``, ``metric``.
+
+        Raises
+        ------
+        Exception
+            If FreeSurfer is not available, atlas transfer fails, or extraction fails.
+        """
+        from fsatlas.atlases.registry import AtlasRegistry  # type: ignore[import]
+        from fsatlas.core.environment import FreeSurferEnv  # type: ignore[import]
+        from fsatlas.core.extract import (  # type: ignore[import]
+            extract_cortical_stats,
+            extract_volumetric_stats,
+        )
+        from fsatlas.core.transfer import transfer_atlas  # type: ignore[import]
+
+        atlas_meta = get_atlas(atlas)
+        fsatlas_name = atlas_meta["fsatlas_name"]
+
+        env = FreeSurferEnv.detect(subjects_dir=self.freesurfer_dir.parent)
+        subject = env.find_subject(self.freesurfer_dir.name)
+        reg = AtlasRegistry()
+        atlas_spec = reg.get(fsatlas_name)
+
+        if atlas_spec.type == "surface":
+            transfer_result = transfer_atlas(atlas_spec, subject, env)
+            df = extract_cortical_stats(atlas_spec, subject, env, transfer_result)
+            return _fsatlas_cortical_to_brainbank(df)
+
+        # -- Volumetric atlas --
+        # Approach 2: try parsing existing stats file directly
+        stats_path = self.freesurfer_dir / "stats" / f"{fsatlas_name}.subcortical.stats"
+        if stats_path.exists():
+            result = _parse_volumetric_stats_file(stats_path)
+            if result is not None:
+                logger.info("Parsed volumetric stats directly from %s", stats_path)
+                return result
+            logger.info(
+                "Stats file %s has generic region names, will regenerate via fsatlas",
+                stats_path,
+            )
+
+        # Approach 1: run fsatlas (ensure atlas is downloaded for ctab)
+        if not atlas_spec.is_downloaded():
+            logger.info("Downloading atlas %s for label data", fsatlas_name)
+            atlas_spec = reg.download(fsatlas_name)
+
+        transfer_result = transfer_atlas(atlas_spec, subject, env)
+
+        # Force regeneration if existing stats file had generic names
+        force = stats_path.exists()
+        df = extract_volumetric_stats(
+            atlas_spec, subject, env, transfer_result, force=force,
+        )
+        return _fsatlas_volumetric_to_brainbank(df)
+
+    # ------------------------------------------------------------------
+    # Stats file parsers (unchanged)
     # ------------------------------------------------------------------
 
     def extract_global_metrics(self) -> pd.DataFrame:
@@ -306,297 +445,173 @@ class FreeSurferExtractor:
             columns=["region_index", "region_label", "hemisphere", "value", "metric"],
         )
 
-    def extract_surface_stats(self, atlas: str) -> dict[str, pd.DataFrame]:
-        """Extract parcellated metrics from pre-computed FreeSurfer stats files.
-
-        This is the primary extraction path when FreeSurfer has already computed
-        parcellation statistics (e.g. via ``mris_anatomical_stats``). It reads
-        the ``lh.*`` and ``rh.*`` stats files and extracts all four metrics at once:
-        thickness (ThickAvg), area (SurfArea), volume (GrayVol), curvature (MeanCurv).
-
-        Stats file column format::
-
-            # ColHeaders StructName NumVert SurfArea GrayVol ThickAvg ThickStd MeanCurv ...
-            7Networks_LH_Vis_1  713  471  1527  2.925  0.457  0.118  ...
-
-        Parameters
-        ----------
-        atlas:
-            Atlas key from the registry (must have ``freesurfer_stats_pattern``).
-
-        Returns
-        -------
-        dict[str, pd.DataFrame]
-            Keys are metric names (``"thickness"``, ``"area"``, ``"volume"``,
-            ``"curvature"``). Each DataFrame has columns:
-            ``region_index``, ``region_label``, ``hemisphere``, ``value``, ``metric``.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the stats files do not exist.
-        ValueError
-            If no data rows are found or atlas lacks ``freesurfer_stats_pattern``.
-        """
-        atlas_meta = get_atlas(atlas)
-        stats_pattern = atlas_meta.get("freesurfer_stats_pattern")
-        if stats_pattern is None:
-            raise ValueError(
-                f"Atlas {atlas!r} has no freesurfer_stats_pattern — "
-                "cannot extract from stats files."
-            )
-
-        # Accumulate rows per metric
-        all_rows: dict[str, list[dict]] = {m: [] for m in _STATS_COL_TO_METRIC.values()}
-        region_counter = 0
-
-        # Determine if this is a bilateral stats file (no ?h. prefix) or hemisphere-specific
-        is_bilateral = not stats_pattern.startswith("?h.")
-
-        if is_bilateral:
-            # Single stats file (e.g. Tian subcortical)
-            stats_path = self.freesurfer_dir / "stats" / stats_pattern
-            if not stats_path.exists():
-                raise FileNotFoundError(f"Stats file not found: {stats_path}")
-            rows_for_hemi, region_counter = _parse_stats_file(
-                stats_path, hemi_label="bilateral", start_index=region_counter
-            )
-            for metric, rows in rows_for_hemi.items():
-                all_rows[metric].extend(rows)
-        else:
-            # Hemisphere-specific stats files (lh.* and rh.*)
-            for hemi, hemi_label in (("lh", "L"), ("rh", "R")):
-                stats_name = stats_pattern.replace("?h", hemi)
-                stats_path = self.freesurfer_dir / "stats" / stats_name
-                if not stats_path.exists():
-                    raise FileNotFoundError(f"Stats file not found: {stats_path}")
-                rows_for_hemi, region_counter = _parse_stats_file(
-                    stats_path, hemi_label=hemi_label, start_index=region_counter
-                )
-                for metric, rows in rows_for_hemi.items():
-                    all_rows[metric].extend(rows)
-
-        # Build DataFrames per metric
-        result: dict[str, pd.DataFrame] = {}
-        cols = ["region_index", "region_label", "hemisphere", "value", "metric"]
-        for metric, rows in all_rows.items():
-            if rows:
-                result[metric] = pd.DataFrame(rows, columns=cols)
-
-        if not result:
-            raise ValueError(f"No parcels found in stats files for atlas {atlas!r}.")
-        return result
-
-    # ------------------------------------------------------------------
-    # Surface parcellation (per-vertex fallback)
-    # ------------------------------------------------------------------
-
-    def extract_surface_morphometrics(
-        self,
-        atlas: str,
-        metric: str,
-    ) -> pd.DataFrame:
-        """Extract parcellated surface morphometrics for a given atlas.
-
-        Loads the atlas annotation file and per-vertex metric file, then
-        computes per-parcel values (mean for thickness/curvature/sulc,
-        sum for area).
-
-        Parameters
-        ----------
-        atlas:
-            Atlas key from the registry (e.g. ``"schaefer400x7"``).
-        metric:
-            One of ``"thickness"``, ``"area"``, ``"curvature"``, ``"sulc"``.
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: ``region_index``, ``region_label``, ``hemisphere``,
-            ``value``, ``metric``.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the annotation or metric file is not present.
-        ValueError
-            If the atlas type does not support surface parcellation.
-        """
-        if metric not in _SURFACE_METRICS:
-            raise ValueError(
-                f"Unsupported metric {metric!r}. "
-                f"Supported: {list(_SURFACE_METRICS)}"
-            )
-
-        atlas_meta = get_atlas(atlas)
-        if atlas_meta["type"] not in ("surface", "combined"):
-            raise ValueError(
-                f"Atlas {atlas!r} is type {atlas_meta['type']!r}; "
-                "surface parcellation requires type 'surface' or 'combined'."
-            )
-
-        annot_pattern = atlas_meta.get("freesurfer_annot_pattern")
-        if annot_pattern is None:
-            raise FileNotFoundError(
-                f"Atlas {atlas!r} has no freesurfer_annot_pattern — "
-                "cannot extract from FreeSurfer surfaces."
-            )
-
-        surf_file = _SURFACE_METRICS[metric]
-        rows = []
-
-        for hemi, hemi_label in (("lh", "L"), ("rh", "R")):
-            annot_name = annot_pattern.replace("?h", hemi)
-            annot_path = self.freesurfer_dir / "label" / annot_name
-            morph_path = self.freesurfer_dir / "surf" / f"{hemi}.{surf_file}"
-
-            if not annot_path.exists():
-                raise FileNotFoundError(
-                    f"Annotation file not found: {annot_path}"
-                )
-            if not morph_path.exists():
-                raise FileNotFoundError(
-                    f"Surface metric file not found: {morph_path}"
-                )
-
-            vertex_labels, ctab, region_names = fsio.read_annot(str(annot_path))
-            vertex_data = fsio.read_morph_data(str(morph_path))
-
-            for i, name in enumerate(region_names):
-                if isinstance(name, bytes):
-                    name = name.decode("utf-8")
-                if name.lower() in _SKIP_REGIONS:
-                    continue
-
-                mask = vertex_labels == i
-                if not mask.any():
-                    continue
-
-                parcel_data = vertex_data[mask]
-                value = float(np.sum(parcel_data) if metric == "area" else np.mean(parcel_data))
-                region_index = int(ctab[i, 4]) if i < len(ctab) else i
-
-                rows.append(
-                    {
-                        "region_index": region_index,
-                        "region_label": name,
-                        "hemisphere": hemi_label,
-                        "value": value,
-                        "metric": metric,
-                    }
-                )
-
-        if not rows:
-            raise ValueError(
-                f"No parcels found for atlas {atlas!r} metric {metric!r}."
-            )
-        return pd.DataFrame(
-            rows,
-            columns=["region_index", "region_label", "hemisphere", "value", "metric"],
-        )
-
 
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
 
-def _parse_stats_file(
-    stats_path: Path,
-    hemi_label: str,
-    start_index: int = 0,
-) -> tuple[dict[str, list[dict]], int]:
-    """Parse a FreeSurfer surface stats file and return per-metric rows.
+def _fsatlas_cortical_to_brainbank(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Convert fsatlas long-format cortical stats to per-metric brainbank DataFrames.
 
     Parameters
     ----------
-    stats_path:
-        Path to the stats file (e.g. ``lh.schaefer400-7.stats``).
-    hemi_label:
-        Hemisphere label to assign: ``"L"``, ``"R"``, or ``"bilateral"``.
-    start_index:
-        Starting integer index for region_index (incremented per parcel).
+    df:
+        Long-format DataFrame from ``extract_cortical_stats()`` with columns:
+        ``subject_id``, ``atlas``, ``hemisphere``, ``region``, ``measure``, ``value``.
 
     Returns
     -------
-    rows_per_metric : dict[str, list[dict]]
-        Maps metric name → list of row dicts.
-    next_index : int
-        Next region_index to use after this file.
+    dict[str, pd.DataFrame]
+        Keys are brainbank metric names. Each DataFrame has columns:
+        ``region_index``, ``region_label``, ``hemisphere``, ``value``, ``metric``.
     """
-    rows_per_metric: dict[str, list[dict]] = {m: [] for m in _STATS_COL_TO_METRIC.values()}
-    col_indices: dict[str, int] = {}
-    region_counter = start_index
+    df = df[df["measure"].isin(_FSATLAS_MEASURE_MAP)].copy()
+    if df.empty:
+        return {}
 
+    df["hemisphere"] = df["hemisphere"].map(_FSATLAS_HEMI_MAP).fillna("bilateral")
+    df["metric"] = df["measure"].map(_FSATLAS_MEASURE_MAP)
+
+    # Assign consistent 1-based region_index across all metrics
+    unique_regions = (
+        df[["region", "hemisphere"]]
+        .drop_duplicates()
+        .sort_values(["hemisphere", "region"])
+        .reset_index(drop=True)
+    )
+    unique_regions["region_index"] = unique_regions.index + 1
+
+    df = df.merge(unique_regions, on=["region", "hemisphere"])
+    df = df.rename(columns={"region": "region_label"})
+
+    result: dict[str, pd.DataFrame] = {}
+    cols = ["region_index", "region_label", "hemisphere", "value", "metric"]
+    for metric, group in df.groupby("metric"):
+        result[metric] = group[cols].reset_index(drop=True)
+
+    return result
+
+
+def _fsatlas_volumetric_to_brainbank(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Convert fsatlas long-format volumetric stats to per-metric brainbank DataFrames.
+
+    Parameters
+    ----------
+    df:
+        Long-format DataFrame from ``extract_volumetric_stats()`` with columns:
+        ``subject_id``, ``atlas``, ``hemisphere``, ``region``, ``measure``, ``value``.
+
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Keys are brainbank metric names (e.g. ``"volume"``). Each DataFrame has
+        columns: ``region_index``, ``region_label``, ``hemisphere``, ``value``, ``metric``.
+    """
+    df = df[df["measure"].isin(_FSATLAS_VOLUMETRIC_MEASURE_MAP)].copy()
+    if df.empty:
+        return {}
+
+    df["hemisphere"] = df["hemisphere"].map(_FSATLAS_HEMI_MAP).fillna("bilateral")
+    df["metric"] = df["measure"].map(_FSATLAS_VOLUMETRIC_MEASURE_MAP)
+
+    unique_regions = (
+        df[["region", "hemisphere"]]
+        .drop_duplicates()
+        .sort_values(["hemisphere", "region"])
+        .reset_index(drop=True)
+    )
+    unique_regions["region_index"] = unique_regions.index + 1
+
+    df = df.merge(unique_regions, on=["region", "hemisphere"])
+    df = df.rename(columns={"region": "region_label"})
+
+    result: dict[str, pd.DataFrame] = {}
+    cols = ["region_index", "region_label", "hemisphere", "value", "metric"]
+    for metric, group in df.groupby("metric"):
+        result[metric] = group[cols].reset_index(drop=True)
+
+    return result
+
+
+def _parse_volumetric_stats_file(
+    stats_path: Path,
+) -> dict[str, pd.DataFrame] | None:
+    """Parse a ``mri_segstats`` ``.subcortical.stats`` file directly.
+
+    Returns ``None`` if the file contains generic ``Seg####`` region names
+    (meaning it was generated without a proper color table).
+
+    Returns
+    -------
+    dict[str, pd.DataFrame] or None
+        Keys are metric names (``"volume"``).  Each DataFrame has columns:
+        ``region_index``, ``region_label``, ``hemisphere``, ``value``, ``metric``.
+    """
+    rows: list[dict] = []
+    in_data = False
     with open(stats_path) as f:
         for line in f:
-            stripped = line.strip()
-
-            # Parse column headers
-            if stripped.startswith("# ColHeaders"):
-                headers = stripped.replace("# ColHeaders", "").split()
-                for col_name, metric in _STATS_COL_TO_METRIC.items():
-                    if col_name in headers:
-                        col_indices[metric] = headers.index(col_name)
+            line = line.strip()
+            if line.startswith("# ColHeaders"):
+                in_data = True
                 continue
-
-            # Skip comment lines and empty lines
-            if stripped.startswith("#") or not stripped:
+            if not in_data or line.startswith("#") or not line:
                 continue
-
-            # Data row
-            parts = stripped.split()
-            if not parts or not col_indices:
+            parts = line.split()
+            if len(parts) < 5:
                 continue
+            seg_id = int(parts[1])
+            volume = float(parts[3])
+            struct_name = parts[4]
+            # Bail out if names are generic (no ctab was used)
+            if re.match(r"^Seg\d+$", struct_name):
+                return None
+            hemisphere = _infer_hemisphere(struct_name)
+            rows.append(
+                {
+                    "region_index": seg_id,
+                    "region_label": struct_name,
+                    "hemisphere": hemisphere,
+                    "value": volume,
+                    "metric": "volume",
+                }
+            )
 
-            struct_name = parts[0]
+    if not rows:
+        return None
 
-            # Skip pseudo-regions
-            if any(skip in struct_name for skip in _SKIP_SUBSTRINGS):
-                continue
-            if struct_name.lower() in _SKIP_REGIONS:
-                continue
-
-            region_counter += 1
-
-            # Determine hemisphere from struct name if file is bilateral
-            effective_hemi = hemi_label
-            if hemi_label == "bilateral":
-                effective_hemi = _struct_hemisphere(struct_name)
-
-            for metric, col_idx in col_indices.items():
-                if col_idx < len(parts):
-                    try:
-                        value = float(parts[col_idx])
-                    except ValueError:
-                        continue
-                    rows_per_metric[metric].append(
-                        {
-                            "region_index": region_counter,
-                            "region_label": struct_name,
-                            "hemisphere": effective_hemi,
-                            "value": value,
-                            "metric": metric,
-                        }
-                    )
-
-    return rows_per_metric, region_counter
+    df = pd.DataFrame(
+        rows,
+        columns=["region_index", "region_label", "hemisphere", "value", "metric"],
+    )
+    return {"volume": df}
 
 
-def _struct_hemisphere(struct_name: str) -> str:
-    """Infer hemisphere from a parcel struct name (for bilateral stats files)."""
-    upper = struct_name.upper()
-    if "_LH_" in upper or upper.startswith("LH_"):
+def _infer_hemisphere(struct_name: str) -> str:
+    """Infer hemisphere from a structure name.
+
+    Handles conventions used by aseg (``Left-``, ``Right-``), Tian
+    (``-lh``, ``-rh`` suffix), and other atlases.
+    """
+    name = struct_name.lower()
+    # Prefix patterns (aseg, some cortical atlases)
+    if name.startswith(("left-", "left_", "lh.", "lh-", "lh_", "l-", "l_")):
         return "L"
-    if "_RH_" in upper or upper.startswith("RH_"):
+    if name.startswith(("right-", "right_", "rh.", "rh-", "rh_", "r-", "r_")):
+        return "R"
+    # Infix patterns
+    if "-lh-" in name or "_lh_" in name:
+        return "L"
+    if "-rh-" in name or "_rh_" in name:
+        return "R"
+    # Suffix patterns (Tian atlas: HIP-rh, CAU-lh)
+    if name.endswith(("-lh", "_lh")):
+        return "L"
+    if name.endswith(("-rh", "_rh")):
         return "R"
     return "bilateral"
 
 
 def _aseg_hemisphere(struct_name: str) -> str:
     """Infer hemisphere label from an aseg structure name."""
-    name = struct_name.lower()
-    if name.startswith("left-") or name.startswith("lh.") or "-lh-" in name:
-        return "L"
-    if name.startswith("right-") or name.startswith("rh.") or "-rh-" in name:
-        return "R"
-    return "bilateral"
+    return _infer_hemisphere(struct_name)

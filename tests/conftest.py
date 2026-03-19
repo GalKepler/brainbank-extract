@@ -143,6 +143,30 @@ def mock_freesurfer_dir(tmp_path: Path) -> Path:
         for surf_name, data in surf_files.items():
             _write_morph(fs_dir / "surf" / f"{hemi}.{surf_name}", data)
 
+    # --- stats/tian-s1.subcortical.stats (volumetric atlas with proper names) ---
+    tian_stats = (
+        "# Title Segmentation Statistics\n"
+        "#\n"
+        "# generating_program mri_segstats\n"
+        "# Measure EstimatedTotalIntraCranialVol, eTIV, Estimated Total Intracranial Volume, 1600000.0, mm^3\n"
+        "# ColHeaders  Index SegId NVoxels Volume_mm3 StructName Mean StdDev Min Max Range\n"
+        "  1   1      5974     5974.0  HIP-rh    87.82   16.47    9.00   110.00   101.00\n"
+        "  2   2      3238     3238.0  AMY-rh    80.35   25.16   17.00   108.00    91.00\n"
+        "  3   3      6042     6042.0  HIP-lh    84.53   18.16   13.00   108.00    95.00\n"
+        "  4   4      3228     3228.0  AMY-lh    79.40   20.74   18.00   110.00    92.00\n"
+    )
+    (fs_dir / "stats" / "tian-s1.subcortical.stats").write_text(tian_stats)
+
+    # --- stats/badatlas.subcortical.stats (generic Seg names — no ctab) ---
+    bad_stats = (
+        "# Title Segmentation Statistics\n"
+        "#\n"
+        "# ColHeaders  Index SegId NVoxels Volume_mm3 StructName Mean StdDev Min Max Range\n"
+        "  1   1      5974     5974.0  Seg0001    87.82   16.47    9.00   110.00   101.00\n"
+        "  2   2      3238     3238.0  Seg0002    80.35   25.16   17.00   108.00    91.00\n"
+    )
+    (fs_dir / "stats" / "badatlas.subcortical.stats").write_text(bad_stats)
+
     return fs_dir
 
 

@@ -11,7 +11,7 @@ from typing import Any
 import nibabel as nib
 import numpy as np
 import pandas as pd
-import scipy.io
+import scipy.io  # type: ignore[import]
 
 from brainbank_extract import __version__
 from brainbank_extract.atlases import (
@@ -23,8 +23,8 @@ from brainbank_extract.io import write_status_json, write_tsv
 
 logger = logging.getLogger(__name__)
 
-# Column names for diffusion scalar output TSVs
-_SCALAR_COLS = ["region_index", "region_label", "hemisphere", "mean", "std", "median", "n_voxels"]
+# Leading columns for diffusion scalar output TSVs (others from VolumetricParcellator follow)
+_SCALAR_LEADING_COLS = ["region_index", "region_label", "hemisphere"]
 
 
 class QSIReconExtractor:
@@ -173,8 +173,8 @@ class QSIReconExtractor:
         """Parcellate scalar dwimap NII files for a given atlas.
 
         Discovers all ``*_model-*_param-*_dwimap.nii.gz`` files across all
-        pipeline subdirectories, loads the atlas segmentation mask, and computes
-        per-parcel statistics (mean, std, median, n_voxels).
+        pipeline subdirectories and uses :class:`~parcellate.VolumetricParcellator`
+        to compute extended per-parcel statistics.
 
         For component atlases (e.g. ``schaefer400x7``), the combined QSIRecon
         segmentation (e.g. ``Schaefer2018N400n7Tian2020S2``) is used and labels
@@ -189,20 +189,23 @@ class QSIReconExtractor:
         -------
         list[pd.DataFrame]
             One DataFrame per (pipeline, model, param) combination found.
-            Each has columns defined by ``_SCALAR_COLS`` plus ``model``, ``param``,
-            ``pipeline``.
+            Each has columns: ``region_index``, ``region_label``, ``hemisphere``,
+            extended statistics (mean, std, median, n_voxels, ...), ``model``,
+            ``param``, ``pipeline``.
 
         Raises
         ------
         FileNotFoundError
             If the atlas segmentation NII is not found.
         """
+        from parcellate import VolumetricParcellator  # type: ignore[import]
+
         seg_name, label_filter = self._resolve_seg_and_filter(atlas)
         atlas_path, labels = self._find_atlas_seg(seg_name)
 
         # Apply label filter for component atlases
         if label_filter is not None:
-            labels = {idx: lbl for idx, lbl in labels.items() if label_filter(lbl)}
+            labels = {idx: lbl for idx, lbl in labels.items() if label_filter(idx, lbl)}
 
         if not labels:
             logger.warning(
@@ -210,47 +213,53 @@ class QSIReconExtractor:
             )
             return []
 
-        # Load atlas segmentation
-        atlas_img = nib.load(str(atlas_path))
-        atlas_data = np.round(atlas_img.get_fdata()).astype(int)
+        # Build LUT DataFrame for VolumetricParcellator
+        lut_df = pd.DataFrame(
+            [(idx, lbl) for idx, lbl in sorted(labels.items())],
+            columns=["index", "label"],
+        )
 
         # Discover all scalar maps across pipelines
         scalar_maps = self._find_scalar_maps()
         if not scalar_maps:
-            logger.info("No scalar dwimap files found for subject %s session %s",
-                        self.subject, self.session)
+            logger.info(
+                "No scalar dwimap files found for subject %s session %s",
+                self.subject, self.session,
+            )
             return []
+
+        # Create parcellator and fit once to the first scalar image's space
+        atlas_img = nib.load(str(atlas_path))
+        parcellator = VolumetricParcellator(
+            atlas_img,
+            lut=lut_df,
+            stat_tier="extended",
+            resampling_target="data",
+        )
+        first_path = scalar_maps[0][0]
+        parcellator.fit(nib.load(str(first_path)))
 
         results = []
         for scalar_path, pipeline, model, param in scalar_maps:
             try:
-                scalar_img = nib.load(str(scalar_path))
-                scalar_data = scalar_img.get_fdata()
+                df = parcellator.transform(scalar_path)
 
-                rows = []
-                for idx, label in sorted(labels.items()):
-                    mask = atlas_data == idx
-                    if not mask.any():
-                        continue
-                    vals = scalar_data[mask]
-                    finite_vals = vals[np.isfinite(vals)]
-                    if len(finite_vals) == 0:
-                        continue
-                    rows.append({
-                        "region_index": idx,
-                        "region_label": label,
-                        "hemisphere": _label_hemisphere(label),
-                        "mean": float(np.mean(finite_vals)),
-                        "std": float(np.std(finite_vals)),
-                        "median": float(np.median(finite_vals)),
-                        "n_voxels": int(mask.sum()),
-                        "model": model,
-                        "param": param,
-                        "pipeline": pipeline,
-                    })
+                # Rename LUT columns to brainbank spec
+                df = df.rename(columns={"index": "region_index", "label": "region_label"})
 
-                if rows:
-                    results.append(pd.DataFrame(rows))
+                # Rename voxel_count → n_voxels for spec compatibility
+                if "voxel_count" in df.columns:
+                    df = df.rename(columns={"voxel_count": "n_voxels"})
+
+                # Add hemisphere inferred from region label
+                df.insert(2, "hemisphere", df["region_label"].apply(_label_hemisphere))
+
+                # Add metadata columns
+                df["model"] = model
+                df["param"] = param
+                df["pipeline"] = pipeline
+
+                results.append(df)
             except Exception as exc:
                 logger.warning("Failed to parcellate %s: %s", scalar_path.name, exc)
 
@@ -259,19 +268,30 @@ class QSIReconExtractor:
     def _extract_and_write_scalars(self, atlas: str) -> int:
         """Extract scalars for an atlas and write TSV files. Returns number of files written."""
         prefix = f"{self.subject}_{self.session}"
-        out_dir = self.output_dir / "dwi" / "scalars"
 
         dfs = self.extract_scalars(atlas)
         written = 0
         for df in dfs:
             model = df["model"].iloc[0]
             param = df["param"].iloc[0]
+            pipeline = df["pipeline"].iloc[0]
+            out_dir = (
+                self.output_dir / "dwi" / "scalars"
+                / f"pipeline-{pipeline}" / f"atlas-{atlas}"
+            )
             fname = (
-                f"{prefix}_atlas-{atlas}_model-{model}_param-{param}"
+                f"{prefix}_atlas-{atlas}_pipeline-{pipeline}"
+                f"_model-{model}_param-{param}"
                 f"_desc-parcellated_diffmetrics.tsv"
             )
-            out_cols = [c for c in _SCALAR_COLS if c in df.columns]
-            write_tsv(df[out_cols], out_dir / fname)
+            # Reorder: leading columns first, then remaining stats columns
+            stat_cols = [
+                c for c in df.columns
+                if c not in _SCALAR_LEADING_COLS + ["model", "param", "pipeline"]
+            ]
+            ordered_cols = _SCALAR_LEADING_COLS + stat_cols + ["model", "param", "pipeline"]
+            ordered_cols = [c for c in ordered_cols if c in df.columns]
+            write_tsv(df[ordered_cols], out_dir / fname)
             written += 1
         return written
 
@@ -310,6 +330,8 @@ class QSIReconExtractor:
         combined_atlas_key : str
             Registry key of the combined atlas whose seg was used.  Equals
             ``atlas`` when the atlas has its own standalone seg.
+        pipeline : str
+            The QSIRecon workflow name (e.g. ``"MRtrix3_act-HSVS"``).
 
         Raises
         ------
@@ -323,12 +345,12 @@ class QSIReconExtractor:
         _, labels_dict = self._find_atlas_seg(seg_name)
         labels = [labels_dict[i] for i in sorted(labels_dict)]
 
-        mat_path = self._find_connectivity_mat()
+        mat_path, pipeline = self._find_connectivity_mat()
         mat_data = scipy.io.loadmat(str(mat_path))
 
         matrix = _extract_mat_matrix(mat_data, measure, expected_size=len(labels))
 
-        return matrix, labels, combined_key
+        return matrix, labels, combined_key, pipeline
 
     def _extract_and_write_connectivity(
         self,
@@ -352,23 +374,32 @@ class QSIReconExtractor:
             return 0
 
         prefix = f"{self.subject}_{self.session}"
-        out_dir = self.output_dir / "dwi" / "connectivity"
 
         seg_name, _ = self._resolve_seg_and_filter(atlas)
         _, labels_dict = self._find_atlas_seg(seg_name)
         labels = [labels_dict[i] for i in sorted(labels_dict)]
 
-        mat_path = self._find_connectivity_mat()
+        mat_path, pipeline = self._find_connectivity_mat()
         mat_data = scipy.io.loadmat(str(mat_path))
 
         # Find all square matrices in the .mat file
         matrices = _find_all_matrices(mat_data, expected_size=len(labels))
         written = 0
 
+        out_dir = (
+            self.output_dir / "dwi" / "connectivity"
+            / f"pipeline-{pipeline}" / f"atlas-{combined_key}"
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
         for measure, matrix in matrices.items():
-            npy_name = f"{prefix}_atlas-{combined_key}_desc-{measure}_connmatrix.npy"
-            labels_name = f"{prefix}_atlas-{combined_key}_desc-{measure}_connmatrix-labels.json"
+            npy_name = (
+                f"{prefix}_atlas-{combined_key}_pipeline-{pipeline}"
+                f"_desc-{measure}_connmatrix.npy"
+            )
+            labels_name = (
+                f"{prefix}_atlas-{combined_key}_pipeline-{pipeline}"
+                f"_desc-{measure}_connmatrix-labels.json"
+            )
             np.save(str(out_dir / npy_name), matrix)
             (out_dir / labels_name).write_text(json.dumps(labels, indent=2))
             written += 2  # .npy + labels JSON
@@ -532,29 +563,40 @@ class QSIReconExtractor:
 
         return [(path, pipeline, model, param) for (pipeline, model, param), (path, _) in found.items()]
 
-    def _find_connectivity_mat(self) -> Path:
-        """Find the MRtrix3 connectivity .mat file for this session."""
+    def _find_connectivity_mat(self) -> tuple[Path, str]:
+        """Find the MRtrix3 connectivity .mat file for this session.
+
+        Returns
+        -------
+        mat_path : Path
+        pipeline : str
+            The workflow name (e.g. ``"MRtrix3_act-HSVS"``).
+        """
+        candidates: list[tuple[Path, str]] = []
+
+        # Prefer MRtrix3 pipeline
         mrtrix_pipeline = self.qsirecon_dir / "derivatives" / "qsirecon-MRtrix3_act-HSVS"
         session_dwi = mrtrix_pipeline / self.subject / self.session / "dwi"
-
-        candidates: list[Path] = []
         if session_dwi.exists():
-            candidates = sorted(session_dwi.glob("*_connectivity.mat"))
+            for p in sorted(session_dwi.glob("*_connectivity.mat")):
+                candidates.append((p, "MRtrix3_act-HSVS"))
 
         if not candidates:
             derivatives_dir = self.qsirecon_dir / "derivatives"
             if derivatives_dir.exists():
                 for pipeline_dir in sorted(derivatives_dir.glob("qsirecon-*")):
+                    pipeline_name = pipeline_dir.name.replace("qsirecon-", "")
                     sd = pipeline_dir / self.subject / self.session / "dwi"
                     if sd.exists():
-                        candidates.extend(sorted(sd.glob("*_connectivity.mat")))
+                        for p in sorted(sd.glob("*_connectivity.mat")):
+                            candidates.append((p, pipeline_name))
 
         if not candidates:
             raise FileNotFoundError(
                 f"No connectivity .mat file found for {self.subject}/{self.session}"
             )
 
-        no_dirap = [p for p in candidates if "dir-AP" not in p.name]
+        no_dirap = [(p, pl) for p, pl in candidates if "dir-AP" not in p.name]
         return no_dirap[0] if no_dirap else candidates[0]
 
 

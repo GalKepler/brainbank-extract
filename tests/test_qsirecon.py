@@ -102,7 +102,7 @@ def test_extract_connectivity_returns_matrix_and_labels(
 ) -> None:
     """extract_connectivity() returns a 2D numpy array and list of labels."""
     ext = _make_extractor(mock_qsirecon_root_dir, tmp_path / "out")
-    matrix, labels, combined_key = ext.extract_connectivity(atlas="4S156Parcels", measure="sift2")
+    matrix, labels, combined_key, pipeline = ext.extract_connectivity(atlas="4S156Parcels", measure="sift2")
 
     assert isinstance(matrix, np.ndarray)
     assert matrix.ndim == 2
@@ -110,12 +110,13 @@ def test_extract_connectivity_returns_matrix_and_labels(
     assert isinstance(labels, list)
     assert len(labels) == matrix.shape[0]
     assert combined_key == "4S156Parcels"
+    assert pipeline == "MRtrix3_act-HSVS"
 
 
 def test_extract_connectivity_symmetric(mock_qsirecon_root_dir: Path, tmp_path: Path) -> None:
     """Connectivity matrix is symmetric."""
     ext = _make_extractor(mock_qsirecon_root_dir, tmp_path / "out")
-    matrix, _, _key = ext.extract_connectivity(atlas="4S156Parcels", measure="sift2")
+    matrix, _, _key, _pipeline = ext.extract_connectivity(atlas="4S156Parcels", measure="sift2")
     assert np.allclose(matrix, matrix.T)
 
 
@@ -124,7 +125,7 @@ def test_extract_connectivity_labels_match_atlas(
 ) -> None:
     """Connectivity labels match the atlas label file."""
     ext = _make_extractor(mock_qsirecon_root_dir, tmp_path / "out")
-    matrix, labels, _key = ext.extract_connectivity(atlas="4S156Parcels", measure="sift2")
+    matrix, labels, _key, _pipeline = ext.extract_connectivity(atlas="4S156Parcels", measure="sift2")
     expected_labels = [MOCK_QSI_LABELS[i] for i in sorted(MOCK_QSI_LABELS)]
     assert labels == expected_labels
 
@@ -172,9 +173,11 @@ def test_extract_writes_scalar_tsvs(mock_qsirecon_root_dir: Path, tmp_path: Path
     ext = _make_extractor(mock_qsirecon_root_dir, out_dir)
     status = ext.extract()
 
-    scalar_files = list((out_dir / "dwi" / "scalars").glob("*.tsv"))
+    scalar_files = list((out_dir / "dwi" / "scalars").rglob("*.tsv"))
     assert len(scalar_files) > 0
     assert status["modalities"]["dwi_scalars"]["n_files"] > 0
+    # Verify pipeline entity appears in filenames
+    assert all("pipeline-" in f.name for f in scalar_files)
 
 
 def test_extract_writes_connectivity_npy(mock_qsirecon_root_dir: Path, tmp_path: Path) -> None:
@@ -183,9 +186,11 @@ def test_extract_writes_connectivity_npy(mock_qsirecon_root_dir: Path, tmp_path:
     ext = _make_extractor(mock_qsirecon_root_dir, out_dir)
     status = ext.extract()
 
-    conn_files = list((out_dir / "dwi" / "connectivity").glob("*.npy"))
+    conn_files = list((out_dir / "dwi" / "connectivity").rglob("*.npy"))
     assert len(conn_files) > 0
     assert status["modalities"]["dwi_connectivity"]["n_files"] > 0
+    # Verify pipeline entity appears in filenames
+    assert all("pipeline-" in f.name for f in conn_files)
 
 
 def test_extract_writes_connectivity_labels_json(mock_qsirecon_root_dir: Path, tmp_path: Path) -> None:
@@ -196,7 +201,7 @@ def test_extract_writes_connectivity_labels_json(mock_qsirecon_root_dir: Path, t
     ext = _make_extractor(mock_qsirecon_root_dir, out_dir)
     ext.extract()
 
-    label_files = list((out_dir / "dwi" / "connectivity").glob("*-labels.json"))
+    label_files = list((out_dir / "dwi" / "connectivity").rglob("*-labels.json"))
     assert len(label_files) > 0
     labels = json.loads(label_files[0].read_text())
     assert isinstance(labels, list)
@@ -285,7 +290,7 @@ def test_schaefer_scalar_output_named_with_component_key(
     ext = _make_combined_extractor(mock_qsirecon_combined_dir, out_dir, ["schaefer100x7"])
     ext.extract()
 
-    scalar_files = list((out_dir / "dwi" / "scalars").glob("*.tsv"))
+    scalar_files = list((out_dir / "dwi" / "scalars").rglob("*.tsv"))
     assert any("atlas-schaefer100x7_" in f.name for f in scalar_files)
     assert not any("tian_s1" in f.name for f in scalar_files)
 
@@ -298,12 +303,12 @@ def test_connectivity_written_under_combined_key(
     ext = _make_combined_extractor(mock_qsirecon_combined_dir, out_dir, ["schaefer100x7"])
     ext.extract()
 
-    conn_files = list((out_dir / "dwi" / "connectivity").glob("*.npy"))
+    conn_files = list((out_dir / "dwi" / "connectivity").rglob("*.npy"))
     assert len(conn_files) > 0
     # File must carry the full combined key (both cortical and subcortical components)
     assert all("schaefer100x7_tian_s1" in f.name for f in conn_files)
-    # Must NOT omit the tian component (i.e. not end the atlas entity at "schaefer100x7_desc-")
-    assert not any("atlas-schaefer100x7_desc-" in f.name for f in conn_files)
+    # Must NOT omit the tian component (i.e. not end the atlas entity at "schaefer100x7_pipeline-")
+    assert not any("atlas-schaefer100x7_pipeline-" in f.name for f in conn_files)
 
 
 def test_connectivity_full_combined_size(
@@ -314,7 +319,7 @@ def test_connectivity_full_combined_size(
     ext = _make_combined_extractor(mock_qsirecon_combined_dir, out_dir, ["schaefer100x7"])
     ext.extract()
 
-    npy_files = list((out_dir / "dwi" / "connectivity").glob("*.npy"))
+    npy_files = list((out_dir / "dwi" / "connectivity").rglob("*.npy"))
     assert len(npy_files) > 0
     mat = np.load(str(npy_files[0]))
     # Full combined atlas has 6 parcels (4 cortical + 2 subcortical)
@@ -332,7 +337,7 @@ def test_connectivity_not_duplicated_for_shared_combined_atlas(
     )
     ext.extract()
 
-    npy_files = list((out_dir / "dwi" / "connectivity").glob("*.npy"))
+    npy_files = list((out_dir / "dwi" / "connectivity").rglob("*.npy"))
     # Should be exactly one .npy per measure (not two copies of the same matrix)
     npy_stems = [f.stem for f in npy_files]
     assert len(npy_stems) == len(set(npy_stems)), "Duplicate connectivity files written"

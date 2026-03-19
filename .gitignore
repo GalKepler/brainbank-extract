@@ -14,4 +14,7 @@ htmlcov/
 *.log
 .DS_Store
 
-data
+/data
+!/src/brainbank_extract/data
+plans
+tmp.ipynb

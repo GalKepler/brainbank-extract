@@ -58,23 +58,75 @@ pip install brainbank-extract
 ### CLI
 
 ```bash
-# 1. Extract features for a single session
+# Extract FreeSurfer + QSIRecon features for a single session
 bb-extract \
   --freesurfer-dir /derivatives/freesurfer/sub-001_ses-20240101 \
   --qsirecon-dir /derivatives/qsirecon \
   --output-dir /derivatives/brainbank-extract/sub-001/ses-20240101 \
-  --atlases schaefer400x7 \
-  --atlases 4S156Parcels \
+  --atlases schaefer400x7_tian_s2 \
+  --atlases 4S456Parcels \
   --subject sub-001 \
   --session ses-20240101
 
-# 2. Aggregate across all sessions (not yet implemented)
-bb-aggregate \
-  --extract-dir /derivatives/brainbank-extract \
-  --output-dir /derivatives/brainbank-extract/aggregated
+# Use the "extended" suite to run a standard set of atlases in one flag
+bb-extract \
+  --freesurfer-dir /derivatives/freesurfer/sub-001_ses-20240101 \
+  --qsirecon-dir /derivatives/qsirecon \
+  --output-dir /derivatives/brainbank-extract/sub-001/ses-20240101 \
+  --atlases extended \
+  --subject sub-001 \
+  --session ses-20240101
+
+# FreeSurfer only (no QSIRecon)
+bb-extract \
+  --freesurfer-dir /derivatives/freesurfer/sub-001_ses-20240101 \
+  --output-dir /derivatives/brainbank-extract/sub-001/ses-20240101 \
+  --atlases desikan --atlases destrieux --atlases aseg \
+  --subject sub-001 --session ses-20240101
+
+# QSIRecon only (no FreeSurfer)
+bb-extract \
+  --qsirecon-dir /derivatives/qsirecon \
+  --output-dir /derivatives/brainbank-extract/sub-001/ses-20240101 \
+  --atlases 4S156Parcels --atlases 4S456Parcels \
+  --subject sub-001 --session ses-20240101
 ```
 
-### Python API
+### Inspect the atlas registry
+
+```python
+from brainbank_extract.atlases import (
+    get_atlas,
+    get_atlas_metadata,
+    list_atlases,
+    list_suites,
+    resolve_atlases,
+    ATLAS_REGISTRY,
+)
+
+# All 80 registered atlas keys
+list_atlases()
+
+# Expand a suite name to individual atlas keys
+resolve_atlases(["extended"])
+# → ['schaefer100x7_tian_s2', '4S156Parcels', 'schaefer400x7_tian_s2',
+#    '4S456Parcels', 'HCPex', 'brainnetome246ext']
+
+# Metadata for a specific atlas
+get_atlas("gordon333ext")
+# → {'full_name': 'Gordon 2016 333-parcel + subcortical extension (385 total)',
+#    'type': 'combined', 'n_parcels': 385, 'qsirecon_seg_name': 'Gordon333Ext',
+#    'components': {'gordon333': {'qsirecon_index_range': [1, 333]},
+#                   'gordon333_subcortical': {'qsirecon_index_range': [335, 386]}}}
+
+# Region-level metadata as a DataFrame
+df = get_atlas_metadata("schaefer400x7_tian_s2")
+#    region_index region_label  hemisphere network_7 ...
+# 0             1    LH_Vis_1           L   Default ...
+# ...         ...         ...         ...       ...
+```
+
+### Python API (aggregated data — not yet implemented)
 
 ```python
 import brainbank_extract as bb
@@ -99,18 +151,12 @@ fa = bb.load_diffusion_scalars(
 # Connectivity matrices
 conn, meta, labels = bb.load_connectivity(
     extract_dir="/derivatives/brainbank-extract/aggregated",
-    atlas="schaefer400x7",
-    measure="atlas_4S156Parcels_radius2_count_connectivity",
+    atlas="4S456Parcels",
+    measure="sift2",
 )
 # conn: np.ndarray (N_sessions, N_parcels, N_parcels)
 # meta: DataFrame with subject/session columns
 # labels: list of region names
-
-# Wide format for ML
-ct_wide = bb.to_wide(ct, index=["subject", "session"], columns="region_label", values="value")
-
-# What's available?
-bb.list_available("/derivatives/brainbank-extract/aggregated")
 ```
 
 ## CLI Reference
@@ -123,18 +169,21 @@ Extract features for a single subject/session. Designed to run inside a Docker c
 Usage: bb-extract [OPTIONS]
 
 Options:
-  --freesurfer-dir PATH   Path to the FreeSurfer subject/session directory
-                          (flat layout: sub-XXX_ses-XXX/ with surf/, label/, stats/).
-  --qsirecon-dir PATH     Path to the ROOT QSIRecon derivatives directory
-                          (contains sub-*/ses-*/dwi/ and derivatives/qsirecon-*/).
-                          Do NOT point to a session-level directory.
-  --output-dir PATH       Output directory for extracted files.  [required]
-  --atlases TEXT          Atlas key(s) to extract. May be repeated.
-                          [default: schaefer400x7]
-  --subject TEXT          BIDS subject identifier (e.g. sub-001).  [required]
-  --session TEXT          BIDS session identifier (e.g. ses-20240101).  [required]
-  --version               Show the version and exit.
-  --help                  Show this message and exit.
+  --freesurfer-dir PATH       Path to the FreeSurfer subject/session directory
+                              (flat layout: sub-XXX_ses-XXX/ with surf/, label/, stats/).
+  --qsirecon-dir PATH         Path to the ROOT QSIRecon derivatives directory
+                              (contains sub-*/ses-*/dwi/ and derivatives/qsirecon-*/).
+                              Do NOT point to a session-level directory.
+  --output-dir PATH           Output directory for extracted files.  [required]
+  --atlases TEXT              Atlas key(s) or suite name(s) to extract. May be
+                              repeated.  [default: schaefer400x7]
+  --subject TEXT              BIDS subject identifier (e.g. sub-001).  [required]
+  --session TEXT              BIDS session identifier (e.g. ses-20240101).  [required]
+  --qsirecon-atlases-dir PATH Path to the QSIRecon atlases directory (atlas-*/
+                              subdirectories). Reserved for future subcortical
+                              volumetric extraction.
+  --version                   Show the version and exit.
+  --help                      Show this message and exit.
 ```
 
 At least one of `--freesurfer-dir` or `--qsirecon-dir` must be provided.
@@ -164,28 +213,113 @@ Options:
 
 ## Supported Atlases
 
-| Key | Full Name | Type | Parcels | FreeSurfer stats | QSIRecon seg name |
-|-----|-----------|------|---------|-----------------|-------------------|
-| `schaefer100x7` | Schaefer 2018, 100 parcels, 7 networks | surface | 100 | `?h.schaefer100-7.stats` | `Schaefer2018N100n7Tian2020S1` |
-| `schaefer200x7` | Schaefer 2018, 200 parcels, 7 networks | surface | 200 | `?h.schaefer200-7.stats` | `Schaefer2018N200n7Tian2020S2` |
-| `schaefer400x7` | Schaefer 2018, 400 parcels, 7 networks | surface | 400 | `?h.schaefer400-7.stats` | `Schaefer2018N400n7Tian2020S2` |
-| `tian_s1` | Tian 2020, Scale I | volumetric | 16 | — | `TianS1` |
-| `tian_s2` | Tian 2020, Scale II | volumetric | 32 | — | `TianS2` |
-| `tian_s3` | Tian 2020, Scale III | volumetric | 50 | `Tian2020S3.stats` | `TianS3` |
-| `4S156Parcels` | 4S 156 Parcels | combined | 156 | — | `4S156Parcels` |
-| `4S256Parcels` | 4S 256 Parcels | combined | 256 | — | `4S256Parcels` |
-| `4S356Parcels` | 4S 356 Parcels | combined | 356 | — | `4S356Parcels` |
-| `4S456Parcels` | 4S 456 Parcels | combined | 456 | — | `4S456Parcels` |
-| `brainnetome246` | Brainnetome Atlas | volumetric | 246 | — | `Brainnetome246` |
-| `aal116` | Automated Anatomical Labeling | volumetric | 116 | — | `AAL116` |
-| `gordon333` | Gordon 2016 | surface | 333 | — | `Gordon333` |
-| `desikan` | Desikan-Killiany (FreeSurfer default) | surface | 68 | `?h.aparc.stats` | `aparc` |
-| `destrieux` | Destrieux (a2009s) | surface | 148 | `?h.aparc.a2009s.stats` | `aparc.a2009s` |
-| `aseg` | FreeSurfer subcortical segmentation | volumetric | ~45 | `aseg.stats` | — |
+The registry contains **80 atlases** across five categories. Use `list_atlases()` or
+`list_suites()` to enumerate them programmatically.
 
-Register custom atlases at runtime:
+### Atlas suites
+
+Pass a suite name anywhere an atlas key is accepted — it expands to a curated list:
+
+| Suite | Contents |
+|-------|----------|
+| `core` | `schaefer100x7_tian_s2`, `4S156Parcels` |
+| `extended` | core + `schaefer400x7_tian_s2`, `4S456Parcels`, `HCPex`, `brainnetome246ext` |
+| `cortical` | `schaefer100x7`–`schaefer400x7`, `desikan`, `destrieux` |
+| `subcortical` | `tian_s1`–`tian_s4`, `aseg` |
+| `full` | Every atlas in the registry |
 
 ```python
+from brainbank_extract.atlases import resolve_atlases, list_suites
+
+# Expand a mix of suite names and individual atlas keys
+resolve_atlases(["core", "destrieux"])
+# → ['schaefer100x7_tian_s2', '4S156Parcels', 'destrieux']
+
+list_suites()
+# → ['core', 'cortical', 'extended', 'full', 'subcortical']
+```
+
+### Schaefer cortical atlases (surface)
+
+Ten resolutions, all paired with 7-network parcellation:
+
+| Key | Parcels | fsatlas name |
+|-----|---------|--------------|
+| `schaefer100x7` | 100 | `schaefer100-7` |
+| `schaefer200x7` | 200 | `schaefer200-7` |
+| `schaefer300x7` | 300 | `schaefer300-7` |
+| … | … | … |
+| `schaefer1000x7` | 1000 | `schaefer1000-7` |
+
+### Tian subcortical atlases (volumetric)
+
+| Key | Parcels | Scale | fsatlas name |
+|-----|---------|-------|--------------|
+| `tian_s1` | 16 | I | `tian-s1` |
+| `tian_s2` | 32 | II | `tian-s2` |
+| `tian_s3` | 50 | III | `tian-s3` |
+| `tian_s4` | 54 | IV | `tian-s4` |
+
+### Schaefer+Tian combined atlases (QSIRecon)
+
+40 entries — every Schaefer resolution paired with every Tian scale.
+FreeSurfer extraction decomposes each into its Schaefer and Tian components.
+
+| Key pattern | n_parcels | QSIRecon seg |
+|-------------|-----------|--------------|
+| `schaefer{N}x7_tian_s{S}` | N + Tian_S parcels | `Schaefer2018N{N}n7Tian2020S{S}` |
+
+Examples: `schaefer100x7_tian_s1` (116), `schaefer400x7_tian_s2` (432), `schaefer1000x7_tian_s4` (1054)
+
+### 4S combined atlases (QSIRecon)
+
+Ten entries pairing each Schaefer resolution with a 56-parcel subcortical extension:
+
+| Key | n_parcels | QSIRecon seg |
+|-----|-----------|--------------|
+| `4S156Parcels` | 156 | `4S156Parcels` |
+| `4S256Parcels` | 256 | `4S256Parcels` |
+| … | … | … |
+| `4S1056Parcels` | 1056 | `4S1056Parcels` |
+
+### Extended atlases (Ext families)
+
+Each Ext atlas has a cortical component (surface, with a future fsatlas entry) and a
+subcortical component. FreeSurfer extraction runs on the cortical component once
+fsatlas entries are added (Phase 2).
+
+| Combined key | n_parcels | Cortical component | Subcortical component |
+|--------------|-----------|-------------------|-----------------------|
+| `gordon333ext` | 385 | `gordon333` (333) | `gordon333_subcortical` (52) |
+| `brainnetome246ext` | 256 | `brainnetome246` (246) | `brainnetome246_subcortical` (10) |
+| `aicha384ext` | 394 | `aicha384` (384) | `aicha384_subcortical` (10) |
+| `HCPex` | 426 | `hcpmmp` (360) | `hcpex_subcortical` (66) |
+
+### FreeSurfer default parcellations
+
+| Key | Parcels | Type | fsatlas name |
+|-----|---------|------|--------------|
+| `desikan` | 68 | surface | `desikan` |
+| `destrieux` | 148 | surface | `destrieux` |
+| `aseg` | ~45 | volumetric | — |
+| `aal116` | 116 | surface | `aal116` |
+
+### Programmatic atlas inspection
+
+```python
+from brainbank_extract.atlases import get_atlas, list_atlases, get_atlas_metadata
+
+# Inspect any atlas
+get_atlas("schaefer400x7_tian_s2")
+# → {'full_name': 'Schaefer 2018 400-parcel 7-network + Tian 2020 Scale II',
+#    'type': 'combined', 'n_parcels': 432, 'qsirecon_seg_name': 'Schaefer2018N400n7Tian2020S2',
+#    'components': {'schaefer400x7': {...}, 'tian_s2': {...}}}
+
+# Load region metadata as a DataFrame
+df = get_atlas_metadata("gordon333ext")
+# → DataFrame with region_index, region_label, hemisphere columns (385 rows)
+
+# Register a custom atlas
 from brainbank_extract.atlases import register_atlas
 register_atlas("myatlas200", {"full_name": "My Atlas", "type": "surface", "n_parcels": 200})
 ```
@@ -273,14 +407,28 @@ in the QSIRecon `*_connectivity.mat` file (e.g.
 
 ## FreeSurfer Extraction Details
 
-For surface atlases, the extractor uses **pre-computed stats files** as the primary
-path (e.g. `lh.schaefer400-7.stats`, `lh.aparc.stats`). These files are produced by
-`mris_anatomical_stats` and contain per-parcel ThickAvg, SurfArea, GrayVol, and
-MeanCurv columns — all four morphometrics are extracted in a single pass.
+For **surface atlases**, the extractor calls `fsatlas` to transfer the atlas to the
+subject's space and run `mris_anatomical_stats`, extracting thickness, surface area,
+gray matter volume, and curvature in a single pass.
 
-If no stats file is found for an atlas, the extractor falls back to per-vertex
-annotation parcellation using `.annot` files and raw surface metric files
-(`lh.thickness`, `lh.area`, etc.).
+For **combined atlases with a `components` dict** (e.g. `schaefer400x7_tian_s2`,
+`gordon333ext`), the extractor decomposes the atlas and processes each component
+separately:
+
+- Cortical components with an `fsatlas_name` (e.g. `schaefer400x7`, `gordon333`) are
+  extracted via fsatlas, producing `atlas-schaefer400x7_desc-thickness_morph.tsv` etc.
+- Subcortical volumetric components with an `fsatlas_name` (e.g. `tian_s1`) are
+  extracted via fsatlas volumetric stats.
+- Subcortical components without an `fsatlas_name` (e.g. `gordon333_subcortical`) are
+  skipped until a volumetric NIfTI extraction path is added (Phase 3B).
+
+For **volumetric atlases** (Tian), the extractor first tries to parse an existing
+`<atlas>.subcortical.stats` file. If the file contains generic `Seg####` region names
+(no colour table was used), it re-runs fsatlas to regenerate the file with proper names.
+
+**Combined atlases without a `components` dict** (e.g. the 4S series) have no defined
+FreeSurfer decomposition and are skipped with a warning — they are extracted via
+QSIRecon only.
 
 ## QSIRecon Extraction Details
 
@@ -332,10 +480,13 @@ uv run pytest tests/test_freesurfer.py -v
 | Component | Status |
 |-----------|--------|
 | Package skeleton & CLI | ✅ Done |
-| Atlas registry | ✅ Done |
+| Atlas registry (80 atlases, suites, index-range filters) | ✅ Done |
 | I/O helpers | ✅ Done |
-| FreeSurfer extractor | ✅ Done |
-| QSIRecon extractor | ✅ Done |
+| FreeSurfer extractor (surface + volumetric + combined decomposition) | ✅ Done |
+| QSIRecon extractor (scalars, connectivity, label filtering) | ✅ Done |
+| dseg TSV files for all 55 QSIRecon atlases | ✅ Done |
+| fsatlas catalog entries for Gordon333, Brainnetome246, AICHA384, AAL116 | ⬜ Phase 2 |
+| FreeSurfer volumetric NIfTI extraction (Ext subcortical components) | ⬜ Phase 3B |
 | Aggregator (`bb-aggregate`) | ⬜ Not started |
 | Python API (`load_*`) | ⬜ Not started |
 | Docker | ⬜ Stub only |
