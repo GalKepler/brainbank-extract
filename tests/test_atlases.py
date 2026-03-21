@@ -114,10 +114,10 @@ def test_aicha384ext_n_parcels() -> None:
     assert ATLAS_REGISTRY["aicha384ext"]["n_parcels"] == 394  # 384 + 10
 
 
-def test_aal116_is_surface() -> None:
-    """aal116 is surface type with fsatlas_name."""
+def test_aal116_is_volumetric() -> None:
+    """aal116 is volumetric type with fsatlas_name."""
     meta = ATLAS_REGISTRY["aal116"]
-    assert meta["type"] == "surface"
+    assert meta["type"] == "volumetric"
     assert meta.get("fsatlas_name") == "aal116"
 
 

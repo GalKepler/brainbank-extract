@@ -146,6 +146,7 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
         "full_name": "HCPex subcortical component (66 parcels)",
         "type": "volumetric",
         "n_parcels": 66,
+        "fsatlas_name": "hcpex_subcortical",
         "qsirecon_component_of": ["HCPex"],
         "qsirecon_index_range": [361, 426],
     },
@@ -180,6 +181,7 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
         "full_name": "Gordon333Ext subcortical component (52 parcels)",
         "type": "volumetric",
         "n_parcels": 52,
+        "fsatlas_name": "gordon333_subcortical",
         "qsirecon_component_of": ["gordon333ext"],
         "qsirecon_index_range": [335, 386],
     },
@@ -237,7 +239,7 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
     # Note: index 385 is absent from the QSIRecon dseg file (gap)
     "aicha384": {
         "full_name": "AICHA 2015, 384 parcels",
-        "type": "surface",
+        "type": "volumetric",
         "n_parcels": 384,
         "fsatlas_name": "aicha384",
         "qsirecon_component_of": ["aicha384ext"],
@@ -245,9 +247,10 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
     },
     # AICHA384 subcortical component (10 parcels, indices 386–395)
     "aicha384_subcortical": {
-        "full_name": "AICHA384Ext subcortical component (10 parcels)",
+        "full_name": "AICHA384Ext cerebellar component (10 parcels)",
         "type": "volumetric",
         "n_parcels": 10,
+        "fsatlas_name": "aicha384_subcortical",
         "qsirecon_component_of": ["aicha384ext"],
         "qsirecon_index_range": [386, 395],
     },
@@ -264,11 +267,11 @@ ATLAS_REGISTRY: dict[str, dict[str, Any]] = {
     },
 
     # ------------------------------------------------------------------
-    # AAL116 standalone (surface extraction via fsatlas mri_vol2surf projection)
+    # AAL116 standalone (volumetric MNI atlas, extracted via mri_vol2vol + mri_segstats)
     # ------------------------------------------------------------------
     "aal116": {
         "full_name": "Automated Anatomical Labeling, 116 regions",
-        "type": "surface",
+        "type": "volumetric",
         "n_parcels": 116,
         "fsatlas_name": "aal116",
         "qsirecon_seg_name": "AAL116",
